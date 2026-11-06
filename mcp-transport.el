@@ -30,6 +30,7 @@
 (require 'jsonrpc)
 (require 'cl-lib)
 (require 'url)
+(require 'plz)
 
 (defclass mcp-process-connection (jsonrpc-process-connection)
   ((connection-type
@@ -293,25 +294,158 @@ An empty list means the response carries no message."
     ("text/event-stream" (mcp--sse-payloads body))
     (_ nil)))
 
-(defun mcp--handle-http-response (connection buffer)
-  "Dispatch the JSON-RPC messages of the HTTP response held in BUFFER.
-BUFFER holds the whole response, headers included.  The status code
-decides nothing: a rejected request still carries a JSON-RPC error body
-that the connection must see."
-  (with-current-buffer buffer
-    (goto-char (point-min))
-    (when (search-forward "\n\n" nil t)
-      (let* ((headers (mcp--parse-http-header
-                       (buffer-substring (point-min) (point))))
-             (body (buffer-substring (point) (point-max)))
-             (payloads (mcp--response-payloads
-                        (plist-get headers :content-type)
-                        body)))
-        (dolist (payload payloads)
-          (when (and (stringp payload)
-                     (not (string-empty-p (string-trim payload))))
-            (when-let* ((message (mcp--parse-json-message payload)))
-              (jsonrpc-connection-receive connection message))))))))
+(defun mcp--http-endpoint (connection)
+  "Return the endpoint URL of CONNECTION."
+  (format "%s://%s:%s%s"
+          (if (mcp--tls connection) "https" "http")
+          (mcp--host connection)
+          (mcp--port connection)
+          (mcp--path connection)))
+
+(defun mcp--http-deliver (connection request-id payload)
+  "Hand PAYLOAD to CONNECTION.
+Return non-nil when PAYLOAD answers the request REQUEST-ID."
+  (when (and (stringp payload)
+             (not (string-empty-p (string-trim payload))))
+    (when-let* ((message (mcp--parse-json-message payload)))
+      (jsonrpc-connection-receive connection message)
+      (and request-id (equal (plist-get message :id) request-id)))))
+
+(defvar mcp--http-streams (make-hash-table :test #'equal)
+  "Response streams in flight, keyed by JSON-RPC request id.
+Each value is a plist with :connection, :pending, :phase, :headers,
+:status, :content-type, :delivered and :process.")
+
+(defconst mcp--http-stream-table-limit 256
+  "Stream table size that triggers a sweep of finished entries.")
+
+(defun mcp--http-prune-streams ()
+  "Drop finished entries once the stream table grows past the limit."
+  (when (> (hash-table-count mcp--http-streams)
+           mcp--http-stream-table-limit)
+    (let (finished)
+      (maphash (lambda (key value)
+                 (when (eq value :finished)
+                   (push key finished)))
+               mcp--http-streams)
+      (dolist (key finished)
+        (remhash key mcp--http-streams)))))
+
+(defun mcp--http-consume (connection request-id proc text)
+  "Consume TEXT from the response stream running on PROC.
+Return the updated stream state.  The state starts in a header phase,
+because curl writes the status line and headers first, and moves to a
+body phase once a non-redirect header block arrives."
+  (let* ((state (or (and request-id (gethash request-id mcp--http-streams))
+                    (list :phase 'headers :pending "" :connection connection)))
+         (pending (concat (or (plist-get state :pending) "") text)))
+    (setq state (plist-put state :pending pending))
+    ;; Header blocks: 1xx and 3xx responses carry no message of their own.
+    (while (and (eq (plist-get state :phase) 'headers)
+                (string-match "\r?\n\r?\n" (plist-get state :pending)))
+      (let* ((pending (plist-get state :pending))
+             (raw (substring pending 0 (match-beginning 0)))
+             (rest (substring pending (match-end 0)))
+             (headers (mcp--parse-http-header raw))
+             (status (plist-get headers :response-code)))
+        (setq state (plist-put state :pending rest))
+        (if (and (stringp status) (string-match-p "\\`[13]" status))
+            (setq state (plist-put state :headers nil))
+          (setq state (plist-put state :headers headers))
+          (setq state (plist-put state :status status))
+          (setq state (plist-put state :content-type
+                                 (plist-get headers :content-type)))
+          (setq state (plist-put state :phase 'body)))))
+    ;; Body: server-sent events arrive incrementally, JSON arrives whole.
+    (when (eq (plist-get state :phase) 'body)
+      (let ((kind (car (split-string (or (plist-get state :content-type) "")
+                                     ";" t))))
+        (when (equal kind "text/event-stream")
+          (let* ((pending (plist-get state :pending))
+                 (parts (split-string pending "\r?\n\r?\n"))
+                 (rest (car (last parts))))
+            (dolist (block (butlast parts))
+              (dolist (payload (mcp--sse-payloads block))
+                (when (mcp--http-deliver connection request-id payload)
+                  (setq state (plist-put state :delivered t)))))
+            (setq state (plist-put state :pending rest))))))
+    (setq state (plist-put state :process proc))
+    (when request-id
+      (puthash request-id state mcp--http-streams))
+    state))
+
+(defun mcp--http-report-failure (connection request-id message)
+  "Report MESSAGE as the failure of REQUEST-ID on CONNECTION.
+Without this the request would sit until the JSON-RPC timeout expired,
+because a transport failure produces no response of its own."
+  (when request-id
+    (jsonrpc-connection-receive
+     connection
+     (list :jsonrpc "2.0"
+           :id request-id
+           :error (list :code -32000 :message message)))))
+
+(defun mcp--http-finish (connection request-id)
+  "Flush and close the response stream of REQUEST-ID.
+A nil REQUEST-ID marks a notification, which expects no response."
+  (let ((state (and request-id (gethash request-id mcp--http-streams))))
+    (cond
+     ;; plz reports success, failure and completion separately; only the
+     ;; first of them may act.
+     ((eq state :finished) nil)
+     ((null state)
+      (mcp--http-report-failure connection request-id
+                                (format "no response from %s"
+                                        (mcp--http-endpoint connection))))
+     (t
+      (puthash request-id :finished mcp--http-streams)
+      (let ((pending (plist-get state :pending)))
+        (when (and (stringp pending)
+                   (not (string-empty-p (string-trim pending))))
+          (dolist (payload (mcp--response-payloads
+                            (plist-get state :content-type)
+                            pending))
+            (when (mcp--http-deliver connection request-id payload)
+              (setq state (plist-put state :delivered t)))))
+        (unless (or (plist-get state :delivered) (not request-id))
+          (mcp--http-report-failure
+           connection request-id
+           (format "HTTP %s from %s"
+                   (or (plist-get state :status) "error")
+                   (mcp--http-endpoint connection))))
+        (when-let* ((proc (plist-get state :process)))
+          (when (process-live-p proc)
+            (delete-process proc))
+          (when (buffer-live-p (process-buffer proc))
+            (kill-buffer (process-buffer proc)))))))))
+
+(defun mcp--http-post (connection body headers request-id)
+  "POST BODY to CONNECTION with HEADERS.
+REQUEST-ID identifies the request the response carries, or nil for a
+notification.  Responses stream back into the JSON-RPC layer as they
+arrive, so a server may send progress notifications before the reply."
+  (when request-id
+    (mcp--http-prune-streams)
+    (puthash request-id
+             (list :connection connection :phase 'headers :pending "")
+             mcp--http-streams))
+  (let ((plz-curl-default-args (append plz-curl-default-args '("--no-buffer"))))
+    (plz 'post
+         (mcp--http-endpoint connection)
+         :headers headers
+         :body body
+         :body-type 'text
+         :as 'response
+         :timeout (mcp--timeout connection)
+         :connect-timeout 10
+         :filter (lambda (proc text)
+                   (mcp--http-consume connection request-id proc text))
+         ;; Whether curl succeeded or not, the stream ends here.  A JSON-RPC
+         ;; error body already reached the connection through the filter, so
+         ;; a non-2xx status needs no separate report.
+         :else (lambda (_err) (mcp--http-finish connection request-id))
+         :then (lambda (_response) (mcp--http-finish connection request-id))
+         :finally (lambda () (mcp--http-finish connection request-id)))))
 
 (cl-defmethod jsonrpc-connection-send ((connection mcp-process-connection)
                                        &rest args
@@ -363,26 +497,16 @@ The message is sent differently based on connection type:
                                :null-object :json-null)))
     (pcase (mcp--connection-type connection)
       ('http
-       (let* ((url-request-method "POST")
-              (url-request-extra-headers
-               (append '(("Content-Type" . "application/json")
-                         ("Accept" . "application/json, text/event-stream"))
-                       (when-let* ((token (mcp--resolve-value (mcp--token connection))))
-                         (list (cons "Authorization" (concat "Bearer " token))))
-                       (mcp--headers connection)))
-              (url-request-data (encode-coding-string json 'utf-8))
-              (url (format "%s://%s:%s%s"
-                           (if (mcp--tls connection) "https" "http")
-                           (mcp--host connection)
-                           (mcp--port connection)
-                           (mcp--path connection))))
-         ;; No protocol session: every POST stands alone, so there is no
-         ;; session header, no endpoint event and no SSE fallback.
-         (url-retrieve url
-                       (lambda (_status)
-                         (unwind-protect
-                             (mcp--handle-http-response connection (current-buffer))
-                           (kill-buffer (current-buffer)))))))
+       (mcp--http-post connection
+                       json
+                       (append '(("Content-Type" . "application/json")
+                                 ("Accept" . "application/json, text/event-stream"))
+                               (list (cons "MCP-Protocol-Version"
+                                           mcp--protocol-version))
+                               (when-let* ((token (mcp--resolve-value (mcp--token connection))))
+                                 (list (cons "Authorization" (concat "Bearer " token))))
+                               (mcp--headers connection))
+                       (plist-get args :id)))
       ('stdio
        (process-send-string
         (jsonrpc--process connection)

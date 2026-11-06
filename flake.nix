@@ -37,7 +37,7 @@
           # Elisp dependencies from the Package-Requires header that nixpkgs
           # already packages.  The header asks for jsonrpc 1.0.25 and nixpkgs
           # ships 1.0.29, which satisfies it.
-          emacsDeps = with pkgs.emacsPackages; [ jsonrpc ];
+          emacsDeps = with pkgs.emacsPackages; [ jsonrpc plz ];
           # Emacs with the dependencies on EMACSLOADPATH, for batch test runs.
           emacs = pkgs.emacsPackages.emacsWithPackages (_: emacsDeps);
           # Byte-compiled leftovers from a local session must never shadow the
@@ -105,7 +105,7 @@
           devShells.default = pkgs.mkShell {
             # Emacs is 31.1 here while the package header keeps a 30.1 floor:
             # nixpkgs-unstable no longer carries emacs30.
-            packages = [ pkgs.emacs ] ++ emacsDeps;
+            packages = [ emacs pkgs.curl ];
           };
         };
     };
