@@ -184,6 +184,39 @@
     (should (equal (plist-get root :uri) "file:///tmp"))
     (should (equal (plist-get root :name) "tmp"))))
 
+;;;; Tool results
+
+(ert-deftest mcp-test-tool-result-text ()
+  "Text content joins into one string."
+  (should (equal (mcp--parse-tool-call-result
+                  (list :resultType "complete"
+                        :content [(:type "text" :text "a")
+                                  (:type "text" :text "b")]))
+                 "a\nb")))
+
+(ert-deftest mcp-test-tool-result-structured-only ()
+  "A structured result without text becomes JSON, not an empty string."
+  (should (equal (mcp--parse-tool-call-result
+                  (list :resultType "complete"
+                        :structuredContent (list :rows [1 2])))
+                 "{\"rows\":[1,2]}")))
+
+(ert-deftest mcp-test-tool-result-text-wins ()
+  "Text content takes precedence over structured content."
+  (should (equal (mcp--parse-tool-call-result
+                  (list :resultType "complete"
+                        :content [(:type "text" :text "shown")]
+                        :structuredContent (list :rows [1])))
+                 "shown")))
+
+(ert-deftest mcp-test-tool-result-interim ()
+  "An interim result raises instead of rendering as nothing."
+  (should (eq t (condition-case nil
+                    (progn (mcp--parse-tool-call-result
+                            (list :resultType "input_required"))
+                           nil)
+                  (mcp-input-required t)))))
+
 ;;;; Pagination and list caching
 
 (defun mcp-test--connection ()

@@ -477,19 +477,28 @@ Returns a list of parsed argument plists."
 RES is a plist representing the tool call result.
 
 The function extracts text content from the result, concatenating it into
-a single string if multiple text entries are present.
+a single string if multiple text entries are present.  A result without
+text but with structuredContent returns that value as a JSON string, so a
+caller never sees a successful tool call as empty output.
 
-Returns the concatenated text or nil if no text content is found."
+Returns the text, the JSON string, or nil when the result carries
+neither."
   (when (mcp--input-required-p res)
     (signal 'mcp-input-required
             "tool call returned an interim result that asked for input"))
-  (string-join
-   (cl-remove-if #'null
-                 (mapcar (lambda (content)
-                           (when (string= "text" (plist-get content :type))
-                             (plist-get content :text)))
-                         (plist-get res :content)))
-   "\n"))
+  (let ((text (string-join
+               (cl-remove-if #'null
+                             (mapcar (lambda (content)
+                                       (when (string= "text" (plist-get content :type))
+                                         (plist-get content :text)))
+                                     (plist-get res :content)))
+               "\n")))
+    (if (not (string-empty-p text))
+        text
+      (when-let* ((structured (plist-get res :structuredContent)))
+        (json-serialize structured
+                        :false-object :json-false
+                        :null-object :json-null)))))
 
 (defun mcp--generate-tool-call-args (args properties)
   "Generate tool call arguments from ARGS and PROPERTIES.
