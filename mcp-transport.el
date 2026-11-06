@@ -182,6 +182,76 @@ Example:
                :response-code
                status-code)))
 
+;;; Per-request protocol metadata
+
+;; The 2026-07-28 revision is stateless: every request repeats the protocol
+;; version, the client capabilities and the client identity.  Nothing here may
+;; depend on a previous request, so the values travel with each message.
+
+(defconst mcp--protocol-version "2026-07-28"
+  "MCP protocol revision this client sends with every request.")
+
+(defconst mcp--client-info '(:name "mcp-emacs" :version "0.1.0")
+  "Client identity reported in `io.modelcontextprotocol/clientInfo'.")
+
+(defconst mcp--meta-reserved-keys
+  '(:io.modelcontextprotocol/protocolVersion
+    :io.modelcontextprotocol/clientCapabilities
+    :io.modelcontextprotocol/clientInfo)
+  "Metadata keys the client sets itself.
+Caller-supplied duplicates are dropped so a request never carries two
+values for the same reserved key.")
+
+(defun mcp--hash-table-to-plist (table)
+  "Return hash TABLE as a plist.
+Keywords stay keywords and everything else becomes a keyword, which is
+what `json-serialize' writes as an object key."
+  (let (plist)
+    (maphash (lambda (key value)
+               (let ((key (cond ((keywordp key) key)
+                                ((symbolp key) (intern (concat ":" (symbol-name key))))
+                                (t (intern (concat ":" (format "%s" key)))))))
+                 (push value plist)
+                 (push key plist)))
+             table)
+    (nreverse plist)))
+
+(defun mcp--params-to-plist (params)
+  "Return PARAMS as a plist.
+PARAMS comes from callers in three shapes: nil, a plist, or a hash
+table (the list requests pass an empty one).  Merging metadata needs a
+single representation."
+  (cond ((null params) nil)
+        ((hash-table-p params) (mcp--hash-table-to-plist params))
+        ((listp params) params)
+        (t (error "Unsupported JSON-RPC params: %S" params))))
+
+(defun mcp--request-meta (&optional caller-meta)
+  "Return the `_meta' plist for a request.
+CALLER-META holds extra keys the caller wants to attach, such as a
+`progressToken'.  Its unknown keys survive.  Reserved keys come from
+this client only."
+  (let ((caller (mcp--params-to-plist caller-meta))
+        ;; An empty hash table serializes as {}, which capability-free
+        ;; clients must send rather than null or an empty list.
+        (capabilities (make-hash-table :test #'equal)))
+    (append
+     (cl-loop for (key value) on caller by #'cddr
+              unless (memq key mcp--meta-reserved-keys)
+              append (list key value))
+     (list :io.modelcontextprotocol/protocolVersion mcp--protocol-version
+           :io.modelcontextprotocol/clientCapabilities capabilities
+           :io.modelcontextprotocol/clientInfo (copy-sequence mcp--client-info)))))
+
+(defun mcp--request-params (params)
+  "Return PARAMS as a plist with per-request protocol metadata added."
+  (let* ((params (mcp--params-to-plist params))
+         (meta (plist-get params :_meta))
+         (body (cl-loop for (key value) on params by #'cddr
+                        unless (eq key :_meta)
+                        append (list key value))))
+    (append body (list :_meta (mcp--request-meta meta)))))
+
 (cl-defmethod jsonrpc-connection-send ((connection mcp-process-connection)
                                        &rest args
                                        &key
@@ -220,6 +290,12 @@ The message is sent differently based on connection type:
   (let* ((kind (cond ((or result-supplied-p error) 'reply)
                      (id 'request)
                      (method 'notification)))
+         ;; Requests carry the protocol version, capabilities and client
+         ;; identity.  Replies and notifications stay untouched: the protocol
+         ;; defines the metadata for requests only.
+         (args (if (eq kind 'request)
+                   (plist-put args :params (mcp--request-params (plist-get args :params)))
+                 args))
          (converted (jsonrpc-convert-to-endpoint connection args kind))
          (json (json-serialize converted
                                :false-object :json-false
