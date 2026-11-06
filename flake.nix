@@ -10,12 +10,17 @@
     inputs@{ flake-parts, ... }:
     # Date of the last commit as YYYY-MM-DD, folded into the version string
     # below.  Flake source info gives it as e.g. "20260922133522", so slice out
-    # the year, month and day and glue them with hyphens.
+    # the year, month and day and glue them with hyphens.  A tree without
+    # commits has no date, so fall back to the epoch.
     let
-      lastModifiedDate = inputs.self.sourceInfo.lastModifiedDate;
-      commitDate = "${builtins.substring 0 4 lastModifiedDate}-${
-        builtins.substring 4 2 lastModifiedDate
-      }-${builtins.substring 6 2 lastModifiedDate}";
+      stamp =
+        let
+          date = inputs.self.sourceInfo.lastModifiedDate;
+        in
+        if date == null then "19700101000000" else date;
+      commitDate = "${builtins.substring 0 4 stamp}-${
+        builtins.substring 4 2 stamp
+      }-${builtins.substring 6 2 stamp}";
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
       # Elisp is architecture independent, so there is no cost in evaluating
@@ -35,8 +40,7 @@
         let
           inherit (pkgs.emacsPackages) melpaBuild;
           # Elisp dependencies from the Package-Requires header that nixpkgs
-          # already packages.  The header asks for jsonrpc 1.0.25 and nixpkgs
-          # ships 1.0.29, which satisfies it.
+          # already packages.
           emacsDeps = with pkgs.emacsPackages; [ jsonrpc plz ];
           # Emacs with the dependencies on EMACSLOADPATH, for batch test runs.
           emacs = pkgs.emacsPackages.emacsWithPackages (_: emacsDeps);
@@ -55,12 +59,11 @@
             # the flake's own source info, so it never goes stale.
             version = "0.1.0-unstable-${commitDate}";
 
-            src = lib.cleanSource ./.;
+            src = src;
 
             packageRequires = emacsDeps;
 
-            # Byte-compilation warnings fail the build.  Keep it on: with no
-            # ERT suite yet, this is the only automated gate the package has.
+            # Byte-compilation warnings fail the build.
             # lint gate tracked in AGENTS.md.
             turnCompilationWarningToError = true;
 
@@ -101,6 +104,67 @@
               -f ert-run-tests-batch-and-exit
             touch $out
           '';
+
+          # Network test: two VMs, real sockets, real subprocesses.  The ERT
+          # suite can only stub the transport, so this is the check that sees
+          # a broken HTTP reader, a colliding request id or a stray timer
+          # error.  The client node runs test/vm/client.el against the fake
+          # server in test/vm/fake_server.py.
+          checks.mcp-vm = pkgs.testers.runNixOSTest {
+            name = "mcp-vm";
+
+            nodes.server =
+              { pkgs, ... }:
+              let
+                fakeServer = "${pkgs.python3}/bin/python3 ${./test/vm/fake_server.py}";
+                service = name: port: {
+                  wantedBy = [ "multi-user.target" ];
+                  after = [ "network.target" ];
+                  serviceConfig = {
+                    ExecStart = "${fakeServer} --transport http --port ${toString port} --name ${name}";
+                    Restart = "always";
+                  };
+                };
+              in
+              {
+                networking.firewall.enable = false;
+                systemd.services.mcp-fake-a = service "a" 8001;
+                systemd.services.mcp-fake-b = service "b" 8002;
+              };
+
+            nodes.client = {
+              environment.systemPackages = [
+                emacs
+                pkgs.curl
+                pkgs.python3
+              ];
+              environment.etc."mcp-src".source = src;
+              environment.variables = {
+                MCP_VM_URL_A = "http://server:8001/mcp";
+                MCP_VM_URL_B = "http://server:8002/mcp";
+                MCP_VM_STATS_A = "http://server:8001/stats";
+                MCP_VM_STATS_B = "http://server:8002/stats";
+                MCP_VM_PYTHON = "${pkgs.python3}/bin/python3";
+                MCP_VM_FAKE = "${./test/vm/fake_server.py}";
+                MCP_VM_ROOT = "/tmp/mcp-vm-root";
+              };
+            };
+
+            testScript = ''
+              start_all()
+              server.wait_for_unit("mcp-fake-a.service")
+              server.wait_for_unit("mcp-fake-b.service")
+              server.wait_for_open_port(8001)
+              server.wait_for_open_port(8002)
+              client.succeed("mkdir -p /tmp/mcp-vm-root")
+              out = client.succeed(
+                  "emacs --batch -L /etc/mcp-src"
+                  " -l /etc/mcp-src/test/vm/client.el"
+              )
+              print(out)
+              assert "PASS: every network check held" in out, out
+            '';
+          };
 
           devShells.default = pkgs.mkShell {
             # Emacs is 31.1 here while the package header keeps a 30.1 floor:

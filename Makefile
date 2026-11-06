@@ -1,4 +1,5 @@
 EMACS ?= emacs
+SYSTEM ?= $(shell nix eval --impure --raw --expr builtins.currentSystem)
 
 # Unit tests run without network access or subprocesses.
 test:
@@ -10,4 +11,8 @@ compile:
 		--eval "(add-to-list 'load-path \"./\")" \
 		-f batch-byte-compile mcp-transport.el mcp.el mcp-hub.el
 
-.PHONY: test compile
+# Real sockets and a real subprocess inside two VMs.  Needs Nix.
+vm-test:
+	nix build .#checks.$(SYSTEM).mcp-vm --print-build-logs
+
+.PHONY: test compile vm-test
