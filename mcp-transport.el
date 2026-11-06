@@ -59,6 +59,12 @@
    (-template-resources
     :initform nil
     :accessor mcp--template-resources)
+   (-list-cache
+    :initform (make-hash-table :test #'equal)
+    :documentation "Cache of list responses, keyed by JSON-RPC method.
+Each value holds the items and, when the server supplied a positive
+ttlMs, the time at which they stop being fresh."
+    :accessor mcp--list-cache)
    (-initial-callback
     :initarg :initial-callback
     :accessor mcp--initial-callback)

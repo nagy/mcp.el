@@ -184,6 +184,72 @@
     (should (equal (plist-get root :uri) "file:///tmp"))
     (should (equal (plist-get root :name) "tmp"))))
 
+;;;; Pagination and list caching
+
+(defun mcp-test--connection ()
+  "Return a connection that needs no process, for pure tests."
+  (make-instance 'mcp-http-process-connection
+                 :name "test"
+                 :connection-type 'http
+                 :process 'empty
+                 :host "127.0.0.1"
+                 :port 1
+                 :tls nil
+                 :path "/mcp"
+                 :token nil
+                 :headers nil
+                 :timeout 1))
+
+(ert-deftest mcp-test-list-pages-follows-cursors ()
+  "Every page contributes items, and the smallest ttl wins."
+  (let ((conn (mcp-test--connection))
+        (calls nil))
+    (cl-letf (((symbol-function 'jsonrpc-request)
+               (lambda (_connection _method params &rest _args)
+                 (push params calls)
+                 (if (= 1 (length calls))
+                     (list :resultType "complete"
+                           :tools [1 2]
+                           :nextCursor "c1"
+                           :ttlMs 5000)
+                   (list :resultType "complete"
+                         :tools [3]
+                         :ttlMs 1000)))))
+      (let ((pages (mcp--list-pages conn :tools/list :tools)))
+        (should (equal (append (car pages) nil) '(1 2 3)))
+        (should (= (cdr pages) 1000))
+        (should (equal (nreverse calls) '(nil (:cursor "c1"))))))))
+
+(ert-deftest mcp-test-list-pages-stops-without-cursor ()
+  "A single page without a cursor ends the walk."
+  (let ((conn (mcp-test--connection)))
+    (cl-letf (((symbol-function 'jsonrpc-request)
+               (lambda (&rest _args)
+                 (list :resultType "complete" :prompts [1]))))
+      (let ((pages (mcp--list-pages conn :prompts/list :prompts)))
+        (should (equal (append (car pages) nil) '(1)))
+        (should-not (cdr pages))))))
+
+(ert-deftest mcp-test-list-cache-freshness ()
+  "Only a positive ttl keeps a list entry fresh."
+  (let ((conn (mcp-test--connection)))
+    (mcp--list-cache-put conn :tools/list [1] 5000)
+    (should (mcp--list-cache-fresh-p (mcp--list-cache-get conn :tools/list)))
+    (dolist (ttl '(0 -5 nil))
+      (mcp--list-cache-put conn :tools/list [1] ttl)
+      (should-not (mcp--list-cache-fresh-p (mcp--list-cache-get conn :tools/list))))))
+
+(ert-deftest mcp-test-list-items-serves-fresh-cache ()
+  "A fresh list answers without touching the server."
+  (let ((conn (mcp-test--connection)))
+    (mcp--list-cache-put conn :tools/list [(:name "cached")] 10000)
+    (cl-letf (((symbol-function 'jsonrpc-request)
+               (lambda (&rest _args)
+                 (ert-fail "a fresh cache must not reach the server"))))
+      (let ((items (mcp--list-items conn :tools/list :tools '-tools nil nil t)))
+        (should (equal (append items nil) '((:name "cached"))))
+        (should (equal (append (mcp--tools conn) nil) '((:name "cached"))))))))
+
 ;;;; Error helpers
 
 (ert-deftest mcp-test-supported-versions-of ()

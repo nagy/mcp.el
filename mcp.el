@@ -53,6 +53,14 @@
   :group 'mcp
   :type 'integer)
 
+(defcustom mcp-cache-lists t
+  "Whether to reuse a list response while its ttlMs stays fresh.
+Servers declare freshness in milliseconds on tools/list, prompts/list,
+resources/list and resources/templates/list.  A nil value asks the server
+again on every list call."
+  :group 'mcp
+  :type 'boolean)
+
 (defcustom mcp-log-size nil
   "Maximum size for logging jsonrpc event.  0 disables, nil means infinite."
   :group 'mcp
@@ -104,6 +112,25 @@ CONNECTION is the JSON-RPC connection object. NAME identifies the
 server. METHOD is the notification name. PARAMS contains the
 notification data."
   (pcase method
+    ((or 'notifications/tools/list_changed
+         'notifications/prompts/list_changed
+         'notifications/resources/list_changed)
+     (when-let* ((connection (gethash name mcp-server-connections)))
+       ;; The notification is an invalidation signal: drop the cached list
+       ;; and reload, so a hub buffer does not keep showing stale entries.
+       (pcase method
+         ('notifications/tools/list_changed
+          (remhash :tools/list (mcp--list-cache connection))
+          (mcp-async-list-tools connection (mcp--tools-callback connection)))
+         ('notifications/prompts/list_changed
+          (remhash :prompts/list (mcp--list-cache connection))
+          (mcp-async-list-prompts connection (mcp--prompts-callback connection)))
+         ('notifications/resources/list_changed
+          (remhash :resources/list (mcp--list-cache connection))
+          (remhash :resources/templates/list (mcp--list-cache connection))
+          (mcp-async-list-resources connection (mcp--resources-callback connection))
+          (mcp-async-list-resource-templates connection
+                                             (mcp--resources-templates-callback connection))))))
     ('notifications/message
      (cond ((or (plist-member (mcp--capabilities connection) :logging)
                 (and (plist-member params :level)
@@ -640,45 +667,127 @@ the response to extract and return text content."
          :args
          (mcp--parse-tool-args properties (or required '())))))))
 
-(defun mcp--list-items (connection method key-name slot-name callback error-callback syncp)
-  "Helper function to list items from the MCP server.
+(defconst mcp--list-max-pages 100
+  "Upper bound on pages read while following list cursors.")
 
-CONNECTION is the MCP connection object.
-METHOD is the JSON-RPC method to call (e.g., :tools/list).
-KEY-NAME is the connection slot to store results (e.g., :tools).
-SLOT-NAME is the connection slot to store results (e.g., -tools).
-CALLBACK is a function to call with the result.
-ERROR-CALLBACK is a function to call on error.
-SYNCP specifies if the operation should be synchronous or asynchronous."
-  (let* ((success-fn (lambda (res)
-                       (when-let* ((items (plist-get res key-name)))
-                         (setf (slot-value connection slot-name) items)
-                         (when callback
-                           (funcall callback connection items)))))
-         (error-fn (jsonrpc-lambda (&key code message _data)
-                     (if error-callback
-                         (funcall error-callback code message)
-                       (message "Sadly, %s mpc server reports %s: %s"
-                                (jsonrpc-name connection) code message))))
-         (args `(,connection
-                 ,method ,(make-hash-table)
-                 :timeout ,(mcp--timeout connection)
-                 ,@(unless syncp `(:success-fn
-                                   ,success-fn))
-                 ,@(unless syncp `(:error-fn
-                                   ,error-fn)))))
-    (if syncp
-        (condition-case-unless-debug res
-            (apply #'jsonrpc-request
-                   args)
-          (jsonrpc-error
-           (pcase res
-             (`(jsonrpc-error ,_ (jsonrpc-error-code . ,code) (jsonrpc-error-message . ,message) ,_)
-              (funcall error-fn (list :code code :message message))
-              nil)))
-          (:success (funcall success-fn res)))
-      (apply #'jsonrpc-async-request
-             args))))
+(defun mcp--list-cache-get (connection method)
+  "Return the list cache entry of CONNECTION for METHOD, or nil."
+  (gethash method (mcp--list-cache connection)))
+
+(defun mcp--list-cache-put (connection method items ttl-ms)
+  "Remember ITEMS for METHOD on CONNECTION for TTL-MS milliseconds.
+A missing, zero or negative ttl makes the entry immediately stale."
+  (puthash method
+           (list :items items
+                 :expires-at (when (and (numberp ttl-ms)
+                                        (> ttl-ms 0))
+                               (time-add (current-time)
+                                         (seconds-to-time (/ ttl-ms 1000.0)))))
+           (mcp--list-cache connection)))
+
+(defun mcp--list-cache-fresh-p (entry)
+  "Return non-nil when cache ENTRY is still fresh."
+  (and entry
+       (plist-get entry :expires-at)
+       (time-less-p (current-time) (plist-get entry :expires-at))))
+
+(defun mcp--list-pages (connection method key-name)
+  "Return (ITEMS . TTL-MS) for the complete list of METHOD.
+Follow every nextCursor, because the connection cache holds whole lists.
+TTL-MS is the smallest positive page ttl, or nil when no page declared
+one, since the assembled list is only as fresh as its weakest page."
+  (let ((items [])
+        (cursor nil)
+        (ttl-ms nil)
+        (pages 0))
+    (catch 'done
+      (while t
+        (setq pages (1+ pages))
+        (when (> pages mcp--list-max-pages)
+          (message "[mcp] %s returned more than %d pages, stopping"
+                   method mcp--list-max-pages)
+          (throw 'done nil))
+        (let* ((params (when cursor (list :cursor cursor)))
+               (result (jsonrpc-request connection method params
+                                        :timeout (mcp--timeout connection)))
+               (page-ttl (plist-get result :ttlMs)))
+          (setq items (vconcat items (append (plist-get result key-name) nil)))
+          (when (and (numberp page-ttl) (> page-ttl 0))
+            (setq ttl-ms (if ttl-ms (min ttl-ms page-ttl) page-ttl)))
+          (setq cursor (plist-get result :nextCursor))
+          (unless (and cursor (not (string-empty-p cursor)))
+            (throw 'done nil)))))
+    (cons items ttl-ms)))
+
+(defun mcp--list-pages-async (connection method key-name done error-callback)
+  "Fetch every page of METHOD, then call DONE with ITEMS and TTL-MS.
+ERROR-CALLBACK receives a code and a message."
+  (cl-labels ((page (cursor items ttl-ms pages)
+                (jsonrpc-async-request
+                 connection method (when cursor (list :cursor cursor))
+                 :timeout (mcp--timeout connection)
+                 :success-fn
+                 (lambda (result)
+                   (let* ((page-ttl (plist-get result :ttlMs))
+                          (items (vconcat items (append (plist-get result key-name) nil)))
+                          (ttl-ms (if (and (numberp page-ttl) (> page-ttl 0))
+                                      (if ttl-ms (min ttl-ms page-ttl) page-ttl)
+                                    ttl-ms))
+                          (next (plist-get result :nextCursor)))
+                     (cond
+                      ((and next (not (string-empty-p next)))
+                       (if (> pages mcp--list-max-pages)
+                           (progn
+                             (message "[mcp] %s returned more than %d pages, stopping"
+                                      method mcp--list-max-pages)
+                             (funcall done items ttl-ms))
+                         (page next items ttl-ms (1+ pages))))
+                      (t (funcall done items ttl-ms)))))
+                 :error-fn
+                 (jsonrpc-lambda (&key code message _data)
+                   (funcall error-callback code message)))))
+    (page nil [] nil 1)))
+
+(defun mcp--list-items (connection method key-name slot-name callback error-callback syncp)
+  "Load the complete list for METHOD from CONNECTION.
+
+Follows cursors so the cached list is complete, and answers from the
+cache while the server-declared ttlMs stays fresh.  KEY-NAME names the
+result field, SLOT-NAME the connection slot that mirrors it.  CALLBACK
+receives CONNECTION and the items.  ERROR-CALLBACK receives a code and a
+message.  SYNCP selects the synchronous path.
+
+Return the cached or fetched items, or nil when the request failed."
+  (let* ((cached (and mcp-cache-lists (mcp--list-cache-get connection method)))
+         (cached-items (plist-get cached :items)))
+    (if (mcp--list-cache-fresh-p cached)
+        (progn
+          (setf (slot-value connection slot-name) cached-items)
+          (when callback
+            (funcall callback connection cached-items))
+          cached-items)
+      (let* ((store (lambda (items ttl-ms)
+                      (setf (slot-value connection slot-name) items)
+                      (mcp--list-cache-put connection method items ttl-ms)
+                      (when callback
+                        (funcall callback connection items))
+                      items))
+             (error-fn (jsonrpc-lambda (&key code message _data)
+                         (if error-callback
+                             (funcall error-callback code message)
+                           (message "Sadly, %s mpc server reports %s: %s"
+                                    (jsonrpc-name connection) code message)))))
+        (if syncp
+            (condition-case-unless-debug err
+                (let ((pages (mcp--list-pages connection method key-name)))
+                  (funcall store (car pages) (cdr pages)))
+              (jsonrpc-error
+               (funcall error-fn
+                        (list :code (alist-get 'jsonrpc-error-code (cdr err))
+                              :message (alist-get 'jsonrpc-error-message (cdr err))))
+               nil))
+          (mcp--list-pages-async connection method key-name store error-fn)
+          cached-items)))))
 
 (defun mcp-async-list-tools (connection &optional callback error-callback)
   "Get a list of tools from the MCP server using the provided CONNECTION.
