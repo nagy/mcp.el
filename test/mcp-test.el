@@ -423,11 +423,11 @@
   "Cancelling an HTTP request closes its stream and reports locally."
   (let ((conn (mcp-test--connection))
         (captured nil))
-    (puthash 7 (list :connection conn :phase 'body) mcp--http-streams)
+    (mcp--http-stream-put conn 7 (list :connection conn :phase 'body))
     (cl-letf (((symbol-function 'jsonrpc-connection-receive)
                (lambda (_connection message) (push message captured))))
       (mcp-cancel-request conn 7 "user quit"))
-    (should (eq (gethash 7 mcp--http-streams) :finished))
+    (should (eq (mcp--http-stream-get conn 7) :finished))
     (should (equal (plist-get (plist-get (car captured) :error) :code) -32800))
     (should (equal (plist-get (plist-get (car captured) :error) :message)
                    "user quit"))))
@@ -447,6 +447,117 @@
     (should (equal (caar sent) :notifications/cancelled))
     (should (equal (plist-get (cdar sent) :requestId) 9))
     (should (equal (plist-get (plist-get (car captured) :error) :code) -32800))))
+
+;;;; Stream table keying and late output
+
+(ert-deftest mcp-test-streams-isolated-per-connection ()
+  "Two connections may use the same request id at the same time."
+  (let ((a (mcp-test--connection))
+        (b (mcp-test--connection))
+        (delivered nil))
+    (cl-letf (((symbol-function 'mcp--http-deliver)
+               (lambda (_connection _id payload)
+                 (push payload delivered)
+                 (not (null payload)))))
+      (mcp--http-consume a 1 nil "data: {\"from\":\"a\"}\n\n")
+      (mcp--http-consume b 1 nil "data: {\"from\":\"b\"}\n\n"))
+    (should (equal (plist-get (mcp--http-stream-get a 1) :pending) ""))
+    (should (equal (plist-get (mcp--http-stream-get b 1) :pending) ""))
+    (should (eq (mcp--http-stream-get a 1)
+                (mcp--http-stream-get a 1)))
+    (should-not (eq (mcp--http-stream-get a 1)
+                    (mcp--http-stream-get b 1)))))
+
+(ert-deftest mcp-test-list-cache-is-per-connection ()
+  "One connection never answers from another connection's list cache."
+  (let ((a (mcp-test--connection))
+        (b (mcp-test--connection)))
+    (should-not (eq (mcp--list-cache a) (mcp--list-cache b)))
+    (mcp--list-cache-put a :tools/list [(:name "a-only")] 60000)
+    (should (mcp--list-cache-get a :tools/list))
+    (should-not (mcp--list-cache-get b :tools/list))))
+
+(ert-deftest mcp-test-consume-ignores-finished-stream ()
+  "Output that arrives after the stream closed does not break the filter."
+  (let ((conn (mcp-test--connection)))
+    (mcp--http-stream-put conn 1 :finished)
+    (should (eq (mcp--http-consume conn 1 nil "HTTP/1.1 200 OK\r\n\r\n{}")
+                :finished))
+    (should (eq (mcp--http-stream-get conn 1) :finished))))
+
+(ert-deftest mcp-test-cancel-leaves-other-connection-alone ()
+  "Cancelling an id on one connection never closes another's stream."
+  (let ((a (mcp-test--connection))
+        (b (mcp-test--connection)))
+    (mcp--http-stream-put a 1 (list :phase 'body))
+    (mcp--http-stream-put b 1 (list :phase 'body))
+    (cl-letf (((symbol-function 'jsonrpc-connection-receive) #'ignore))
+      (mcp-cancel-request b 1))
+    (should (eq (mcp--http-stream-get b 1) :finished))
+    (should (equal (mcp--http-stream-get a 1) (list :phase 'body)))))
+
+;;;; HTTP headers that follow the JSON body
+
+(ert-deftest mcp-test-header-scalar-booleans ()
+  "A boolean header spells the JSON value, not the Lisp one."
+  (should (equal (mcp--header-scalar t) "true"))
+  (should (equal (mcp--header-scalar :json-false) "false"))
+  (should-not (mcp--header-scalar nil))
+  (should (equal (mcp--header-scalar 42) "42"))
+  (should (equal (mcp--header-scalar "us-west1") "us-west1")))
+
+(defun mcp-test--decode-header (value)
+  "Return the decoded text of header VALUE."
+  (if (and (string-prefix-p "=?base64?" value)
+           (string-suffix-p "?=" value))
+      (decode-coding-string
+       (base64-decode-string (substring value 9 (- (length value) 2)))
+       'utf-8)
+    value))
+
+(ert-deftest mcp-test-header-value-quotes ()
+  "A value holding a quote or a backslash stays out of the curl config."
+  (dolist (value '("say \"hi\"" "back\\slash" "=?base64?x?="))
+    (let ((encoded (mcp--header-value value)))
+      (should (string-prefix-p "=?base64?" encoded))
+      (should (equal (mcp-test--decode-header encoded) value))))
+  (should (equal (mcp--header-value "plain-value") "plain-value")))
+
+(ert-deftest mcp-test-http-headers-boolean-parameter ()
+  "A false parameter mirrors as false, like the body says."
+  (let* ((conn (mcp-test--connection))
+         (tool (mcp-test--tool "flag"
+                               (mcp-test--schema
+                                :on (list :type "boolean" :x-mcp-header "On")))))
+    (setf (mcp--tools conn) (vector tool))
+    (let* ((headers (mcp--http-headers
+                     conn
+                     (list :method "tools/call"
+                           :params (list :name "flag"
+                                         :arguments (list :on :json-false)))))
+           (value (cdr (assoc "Mcp-Param-On" headers))))
+      (should (equal value "false")))))
+
+(ert-deftest mcp-test-http-headers-reply-has-no-method ()
+  "A reply carries no method, so it gets no Mcp-Method header."
+  (let* ((conn (mcp-test--connection))
+         (headers (mcp--http-headers
+                   conn
+                   (list :id 3 :error (list :code -32601 :message "no")))))
+    (should-not (assoc "Mcp-Method" headers))
+    (should-not (assoc "Mcp-Name" headers))
+    (should (assoc "MCP-Protocol-Version" headers))))
+
+;;;; Response payloads with a sloppy content type
+
+(ert-deftest mcp-test-response-payloads-missing-content-type ()
+  "A JSON body counts as JSON even without the content type."
+  (should (equal (mcp--response-payloads nil "{\"jsonrpc\":\"2.0\"}")
+                 '("{\"jsonrpc\":\"2.0\"}")))
+  (should (equal (mcp--response-payloads "text/plain" "{\"ok\":true}")
+                 '("{\"ok\":true}")))
+  (should-not (mcp--response-payloads "text/html" "<html></html>"))
+  (should-not (mcp--response-payloads nil "")))
 
 ;;;; Error helpers
 

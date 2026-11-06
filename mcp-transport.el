@@ -22,8 +22,9 @@
 ;;; Commentary:
 
 ;; Transport layer for MCP connections: the connection classes, the
-;; JSON-RPC send method for stdio and HTTP, the stdio framing filter,
-;; and the legacy HTTP+SSE stream setup.
+;; JSON-RPC send method for stdio and Streamable HTTP, the stdio framing
+;; filter, the streamed HTTP response reader, and the request headers the
+;; stateless revision requires.
 
 ;;; Code:
 
@@ -61,11 +62,13 @@
     :initform nil
     :accessor mcp--template-resources)
    (-list-cache
-    :initform (make-hash-table :test #'equal)
+    :initform nil
     :documentation "Cache of list responses, keyed by JSON-RPC method.
 Each value holds the items and, when the server supplied a positive
-ttlMs, the time at which they stop being fresh."
-    :accessor mcp--list-cache)
+ttlMs, the time at which they stop being fresh.  The table starts as
+nil and `mcp--list-cache' creates it, because an `:initform' holding a
+hash table is evaluated once for the whole class and would then be
+shared by every connection.")
    (-initial-callback
     :initarg :initial-callback
     :accessor mcp--initial-callback)
@@ -134,6 +137,14 @@ When nil, uses `jsonrpc-default-request-timeout'."))
   "Init mcp process connection."
   (shared-initialize conn slots)
   (setf (jsonrpc--process conn) nil))
+
+(defun mcp--list-cache (connection)
+  "Return the list cache of CONNECTION, creating it on first use.
+The table belongs to one connection.  A shared one would let the list
+answer of one server answer a call that another server never saw."
+  (or (slot-value connection '-list-cache)
+      (setf (slot-value connection '-list-cache)
+            (make-hash-table :test #'equal))))
 
 (cl-defmethod jsonrpc-running-p ((conn mcp-http-process-connection))
   "Return non-nil if JSONRPC connection CONN is running."
@@ -288,11 +299,14 @@ this client only."
 
 (defun mcp--response-payloads (content-type body)
   "Return the JSON payloads carried by BODY of CONTENT-TYPE.
-An empty list means the response carries no message."
+An empty list means the response carries no message.  A server that omits
+or mislabels the content type still means to send a JSON-RPC message, so
+a body that starts like a JSON object counts as JSON."
   (pcase (car (split-string (or content-type "") ";" t))
     ("application/json" (list body))
     ("text/event-stream" (mcp--sse-payloads body))
-    (_ nil)))
+    (_ (when (string-prefix-p "{" (string-trim-left (or body "")))
+         (list body)))))
 
 (defun mcp--http-endpoint (connection)
   "Return the endpoint URL of CONNECTION."
@@ -311,68 +325,92 @@ Return non-nil when PAYLOAD answers the request REQUEST-ID."
       (jsonrpc-connection-receive connection message)
       (and request-id (equal (plist-get message :id) request-id)))))
 
-(defvar mcp--http-streams (make-hash-table :test #'equal)
-  "Response streams in flight, keyed by JSON-RPC request id.
-Each value is a plist with :connection, :pending, :phase, :headers,
+(defvar mcp--http-streams (make-hash-table :test #'eq)
+  "Response streams in flight.
+The outer table maps a connection to its inner table, which maps a
+JSON-RPC request id to the state of that response.  Keying by connection
+matters: every connection numbers its own requests from one, so a table
+keyed by id alone would let two servers overwrite each other's streams.
+Each state is a plist with :connection, :pending, :phase, :headers,
 :status, :content-type, :delivered and :process.")
+
+(defun mcp--http-streams-of (connection)
+  "Return the request table of CONNECTION, creating it when absent."
+  (or (gethash connection mcp--http-streams)
+      (puthash connection (make-hash-table :test #'equal)
+               mcp--http-streams)))
+
+(defun mcp--http-stream-get (connection request-id)
+  "Return the stream state of REQUEST-ID on CONNECTION, or nil."
+  (and request-id
+       (gethash request-id (mcp--http-streams-of connection))))
+
+(defun mcp--http-stream-put (connection request-id state)
+  "Remember STATE for REQUEST-ID on CONNECTION."
+  (puthash request-id state (mcp--http-streams-of connection)))
 
 (defconst mcp--http-stream-table-limit 256
   "Stream table size that triggers a sweep of finished entries.")
 
-(defun mcp--http-prune-streams ()
-  "Drop finished entries once the stream table grows past the limit."
-  (when (> (hash-table-count mcp--http-streams)
-           mcp--http-stream-table-limit)
-    (let (finished)
-      (maphash (lambda (key value)
-                 (when (eq value :finished)
-                   (push key finished)))
-               mcp--http-streams)
-      (dolist (key finished)
-        (remhash key mcp--http-streams)))))
+(defun mcp--http-prune-streams (connection)
+  "Drop the finished streams of CONNECTION once its table grows."
+  (let ((streams (mcp--http-streams-of connection)))
+    (when (> (hash-table-count streams)
+             mcp--http-stream-table-limit)
+      (let (finished)
+        (maphash (lambda (key value)
+                   (when (eq value :finished)
+                     (push key finished)))
+                 streams)
+        (dolist (key finished)
+          (remhash key streams))))))
 
 (defun mcp--http-consume (connection request-id proc text)
   "Consume TEXT from the response stream running on PROC.
 Return the updated stream state.  The state starts in a header phase,
 because curl writes the status line and headers first, and moves to a
-body phase once a non-redirect header block arrives."
-  (let* ((state (or (and request-id (gethash request-id mcp--http-streams))
-                    (list :phase 'headers :pending "" :connection connection)))
-         (pending (concat (or (plist-get state :pending) "") text)))
-    (setq state (plist-put state :pending pending))
-    ;; Header blocks: 1xx and 3xx responses carry no message of their own.
-    (while (and (eq (plist-get state :phase) 'headers)
-                (string-match "\r?\n\r?\n" (plist-get state :pending)))
-      (let* ((pending (plist-get state :pending))
-             (raw (substring pending 0 (match-beginning 0)))
-             (rest (substring pending (match-end 0)))
-             (headers (mcp--parse-http-header raw))
-             (status (plist-get headers :response-code)))
-        (setq state (plist-put state :pending rest))
-        (if (and (stringp status) (string-match-p "\\`[13]" status))
-            (setq state (plist-put state :headers nil))
-          (setq state (plist-put state :headers headers))
-          (setq state (plist-put state :status status))
-          (setq state (plist-put state :content-type
-                                 (plist-get headers :content-type)))
-          (setq state (plist-put state :phase 'body)))))
-    ;; Body: server-sent events arrive incrementally, JSON arrives whole.
-    (when (eq (plist-get state :phase) 'body)
-      (let ((kind (car (split-string (or (plist-get state :content-type) "")
-                                     ";" t))))
-        (when (equal kind "text/event-stream")
+body phase once a non-redirect header block arrives.  A stream that
+already finished ignores late output."
+  (let ((state (mcp--http-stream-get connection request-id)))
+    (if (eq state :finished)
+        state
+      (let* ((state (or state (list :phase 'headers :pending ""
+                                    :connection connection)))
+             (pending (concat (or (plist-get state :pending) "") text)))
+        (setq state (plist-put state :pending pending))
+        ;; Header blocks: 1xx and 3xx responses carry no message of their own.
+        (while (and (eq (plist-get state :phase) 'headers)
+                    (string-match "\r?\n\r?\n" (plist-get state :pending)))
           (let* ((pending (plist-get state :pending))
-                 (parts (split-string pending "\r?\n\r?\n"))
-                 (rest (car (last parts))))
-            (dolist (block (butlast parts))
-              (dolist (payload (mcp--sse-payloads block))
-                (when (mcp--http-deliver connection request-id payload)
-                  (setq state (plist-put state :delivered t)))))
-            (setq state (plist-put state :pending rest))))))
-    (setq state (plist-put state :process proc))
-    (when request-id
-      (puthash request-id state mcp--http-streams))
-    state))
+                 (raw (substring pending 0 (match-beginning 0)))
+                 (rest (substring pending (match-end 0)))
+                 (headers (mcp--parse-http-header raw))
+                 (status (plist-get headers :response-code)))
+            (setq state (plist-put state :pending rest))
+            (if (and (stringp status) (string-match-p "\\`[13]" status))
+                (setq state (plist-put state :headers nil))
+              (setq state (plist-put state :headers headers))
+              (setq state (plist-put state :status status))
+              (setq state (plist-put state :content-type
+                                     (plist-get headers :content-type)))
+              (setq state (plist-put state :phase 'body)))))
+        ;; Body: server-sent events arrive incrementally, JSON arrives whole.
+        (when (eq (plist-get state :phase) 'body)
+          (let ((kind (car (split-string (or (plist-get state :content-type) "")
+                                         ";" t))))
+            (when (equal kind "text/event-stream")
+              (let* ((pending (plist-get state :pending))
+                     (parts (split-string pending "\r?\n\r?\n"))
+                     (rest (car (last parts))))
+                (dolist (block (butlast parts))
+                  (dolist (payload (mcp--sse-payloads block))
+                    (when (mcp--http-deliver connection request-id payload)
+                      (setq state (plist-put state :delivered t)))))
+                (setq state (plist-put state :pending rest))))))
+        (setq state (plist-put state :process proc))
+        (when request-id
+          (mcp--http-stream-put connection request-id state))
+        state))))
 
 (defun mcp--http-report-failure (connection request-id message)
   "Report MESSAGE as the failure of REQUEST-ID on CONNECTION.
@@ -388,7 +426,7 @@ because a transport failure produces no response of its own."
 (defun mcp--http-finish (connection request-id)
   "Flush and close the response stream of REQUEST-ID.
 A nil REQUEST-ID marks a notification, which expects no response."
-  (let ((state (and request-id (gethash request-id mcp--http-streams))))
+  (let ((state (mcp--http-stream-get connection request-id)))
     (cond
      ;; plz reports success, failure and completion separately; only the
      ;; first of them may act.
@@ -398,7 +436,7 @@ A nil REQUEST-ID marks a notification, which expects no response."
                                 (format "no response from %s"
                                         (mcp--http-endpoint connection))))
      (t
-      (puthash request-id :finished mcp--http-streams)
+      (mcp--http-stream-put connection request-id :finished)
       (let ((pending (plist-get state :pending)))
         (when (and (stringp pending)
                    (not (string-empty-p (string-trim pending))))
@@ -413,11 +451,9 @@ A nil REQUEST-ID marks a notification, which expects no response."
            (format "HTTP %s from %s"
                    (or (plist-get state :status) "error")
                    (mcp--http-endpoint connection))))
-        (when-let* ((proc (plist-get state :process)))
-          (when (process-live-p proc)
-            (delete-process proc))
-          (when (buffer-live-p (process-buffer proc))
-            (kill-buffer (process-buffer proc)))))))))
+        ;; The curl process and its buffer belong to plz, which closes
+        ;; both once it reports the response.
+        nil)))))
 
 ;;; HTTP request headers
 
@@ -438,10 +474,14 @@ A nil REQUEST-ID marks a notification, which expects no response."
 (defun mcp--header-value (value)
   "Return VALUE encoded for an MCP request header.
 Only visible ASCII, space and tab may appear verbatim.  Anything else,
-and any value that looks like the marker syntax itself, travels as
-base64 of its UTF-8 bytes."
+any value holding a quote or a backslash, and any value that looks like
+the marker syntax itself travels as base64 of its UTF-8 bytes: plz
+writes headers into a curl config file, where a quote or a backslash
+would end the argument."
   (let ((string (format "%s" value)))
     (if (or (string-match-p "[^\t !-~]" string)
+            (string-search "\"" string)
+            (string-search "\\" string)
             (and (string-prefix-p mcp--header-sentinel-prefix string)
                  (string-suffix-p mcp--header-sentinel-suffix string)))
         (format "%s%s%s"
@@ -586,19 +626,39 @@ beyond that range is dropped with a warning instead of being sent."
       nil))
    (t t)))
 
+(defun mcp--header-scalar (value)
+  "Return VALUE as the text the JSON body shows for it, or nil.
+A JSON true arrives as `t' and a JSON false as `:json-false', so a
+header must say \"true\" or \"false\", never \"t\" or \":json-false\".
+Nil stands for an argument the caller left out, which produces no
+header."
+  (cond ((eq value t) "true")
+        ((eq value :json-false) "false")
+        ((null value) nil)
+        ((numberp value) (number-to-string value))
+        (t (format "%s" value))))
+
 (defun mcp--tool-param-headers (connection tool-name arguments)
   "Return Mcp-Param headers for TOOL-NAME called with ARGUMENTS.
 TOOL-NAME is looked up in the tools of CONNECTION, which carry the
-annotations that name each header."
+annotations that name each header.  A tool whose annotations stopped
+being valid yields no headers instead of breaking the send."
   (when-let* ((tool (cl-find tool-name
                             (mcp--tools connection)
                             :test #'equal
                             :key (lambda (tool) (plist-get tool :name)))))
-    (cl-loop for (path . name) in (mcp--tool-header-fields tool)
-             for value = (mcp--path-value arguments path)
-             when (mcp--header-mirrorable-p value name tool-name)
-             collect (cons (concat "Mcp-Param-" name)
-                           (mcp--header-value value)))))
+    (condition-case err
+        (cl-loop for (path . name) in (mcp--tool-header-fields tool)
+                 for value = (mcp--path-value arguments path)
+                 for text = (mcp--header-scalar value)
+                 when (and text
+                           (mcp--header-mirrorable-p value name tool-name))
+                 collect (cons (concat "Mcp-Param-" name)
+                               (mcp--header-value text)))
+      (mcp-invalid-tool
+       (message "[mcp] not mirroring parameters of %s: %s"
+                tool-name (error-message-string err))
+       nil))))
 
 (defun mcp--http-headers (connection args)
   "Return the request headers for ARGS on CONNECTION.
@@ -611,8 +671,10 @@ ARGS holds the JSON-RPC method, parameters and id of the message."
     (append
      '(("Content-Type" . "application/json")
        ("Accept" . "application/json, text/event-stream"))
-     (list (cons "MCP-Protocol-Version" mcp--protocol-version)
-           (cons "Mcp-Method" method))
+     (list (cons "MCP-Protocol-Version" mcp--protocol-version))
+     ;; A reply carries no method, so it gets no method header.
+     (when method
+       (list (cons "Mcp-Method" method)))
      (when name
        (list (cons "Mcp-Name" (mcp--header-value name))))
      (when-let* ((token (mcp--resolve-value (mcp--token connection))))
@@ -630,27 +692,25 @@ ARGS holds the JSON-RPC method, parameters and id of the message."
   "Close the response stream of REQUEST-ID on CONNECTION.
 Return non-nil when a stream was open.  Closing the stream is how the
 transport withdraws a request: the revision has no resumable streams and
-no session to cancel within."
-  (let ((state (gethash request-id mcp--http-streams)))
-    (when (and state
-               (not (eq state :finished))
-               (eq (plist-get state :connection) connection))
+no session to cancel within.  plz leaves a deleted process alone, so this
+closes its buffer too."
+  (let ((state (mcp--http-stream-get connection request-id)))
+    (when (and state (not (eq state :finished)))
       (when-let* ((proc (plist-get state :process)))
         (when (process-live-p proc)
           (delete-process proc))
         (when (buffer-live-p (process-buffer proc))
           (kill-buffer (process-buffer proc))))
-      (puthash request-id :finished mcp--http-streams)
+      (mcp--http-stream-put connection request-id :finished)
       t)))
 
 (defun mcp--http-cancel-streams (connection)
   "Close every response stream belonging to CONNECTION."
   (let (ids)
     (maphash (lambda (request-id state)
-               (when (and (not (eq state :finished))
-                          (eq (plist-get state :connection) connection))
+               (unless (eq state :finished)
                  (push request-id ids)))
-             mcp--http-streams)
+             (mcp--http-streams-of connection))
     (dolist (request-id ids)
       (mcp--http-cancel connection request-id))))
 
@@ -660,10 +720,10 @@ REQUEST-ID identifies the request the response carries, or nil for a
 notification.  Responses stream back into the JSON-RPC layer as they
 arrive, so a server may send progress notifications before the reply."
   (when request-id
-    (mcp--http-prune-streams)
-    (puthash request-id
-             (list :connection connection :phase 'headers :pending "")
-             mcp--http-streams))
+    (mcp--http-prune-streams connection)
+    (mcp--http-stream-put connection request-id
+                          (list :connection connection :phase 'headers
+                                :pending "")))
   (let ((plz-curl-default-args (append plz-curl-default-args '("--no-buffer"))))
     (plz 'post
          (mcp--http-endpoint connection)
@@ -674,6 +734,12 @@ arrive, so a server may send progress notifications before the reply."
          :timeout (mcp--timeout connection)
          :connect-timeout 10
          :filter (lambda (proc text)
+                   ;; plz parses the response from the process buffer, so
+                   ;; the text must land there as well as in this reader.
+                   (when (buffer-live-p (process-buffer proc))
+                     (with-current-buffer (process-buffer proc)
+                       (goto-char (point-max))
+                       (insert text)))
                    (mcp--http-consume connection request-id proc text))
          ;; Whether curl succeeded or not, the stream ends here.  A JSON-RPC
          ;; error body already reached the connection through the filter, so
@@ -707,7 +773,7 @@ For notifications, only :method is required.
 For replies, either :_result or :error should be provided.
 
 The message is sent differently based on connection type:
-- SSE connections use HTTP POST requests
+- HTTP connections send one POST per message
 - Stdio connections write directly to the process"
   (when method
     ;; sanitize method into a string
@@ -735,7 +801,9 @@ The message is sent differently based on connection type:
        (mcp--http-post connection
                        json
                        (mcp--http-headers connection args)
-                       (plist-get args :id)))
+                       ;; Only a request owns a response stream.  A reply
+                       ;; carries an id too, but nothing will answer it.
+                       (when (eq kind 'request) id)))
       ('stdio
        (process-send-string
         (jsonrpc--process connection)
