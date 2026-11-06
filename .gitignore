@@ -1,3 +1,6 @@
 *.elc
 mcp-pkg.el
 mcp-autoloads.el
+result
+result-*
+.direnv/
