@@ -75,21 +75,19 @@ than a request."
 (defvar mcp-server-connections (make-hash-table :test #'equal)
   "Mcp server process.")
 
-(defun mcp--roots-result (connection)
-  "Return the roots of CONNECTION as a ListRootsResult plist."
-  (let ((roots (condition-case nil
-                   (mcp--roots connection)
-                 (error nil))))
-    (list :roots
-          (if roots
-              (vconcat (mapcar (lambda (root)
-                                 (if (stringp root)
-                                     (list :uri (concat "file://" (expand-file-name root))
-                                           :name (file-name-nondirectory
-                                                  (directory-file-name root)))
-                                   root))
-                               roots))
-            []))))
+(defun mcp--roots-result (roots)
+  "Return ROOTS as a ListRootsResult plist.
+ROOTS holds directory strings or ready-made root plists."
+  (list :roots
+        (if roots
+            (vconcat (mapcar (lambda (root)
+                               (if (stringp root)
+                                   (list :uri (concat "file://" (expand-file-name root))
+                                         :name (file-name-nondirectory
+                                                (directory-file-name root)))
+                                 root))
+                             roots))
+          [])))
 
 (defun mcp--reject-server-request (name method _params)
   "Refuse an unsolicited request from server NAME.
@@ -516,31 +514,32 @@ Returns a plist of argument names and values ready for tool invocation."
 Results from earlier revisions carry no `resultType' and mean complete."
   (equal (plist-get result :resultType) "input_required"))
 
-(defun mcp--mrtr-responses (connection input-requests)
+(defun mcp--mrtr-responses (roots input-requests)
   "Return responses for the INPUT-REQUESTS of a multi round-trip request.
-INPUT-REQUESTS maps server-chosen keys to request objects.  Signal
-`mcp-input-required' for a request this client cannot answer, which is
-only possible for capabilities it never declared."
+ROOTS holds the client roots to offer.  INPUT-REQUESTS maps
+server-chosen keys to request objects.  Signal `mcp-input-required' for a
+request this client cannot answer, which is only possible for
+capabilities it never declared."
   (let (responses)
     (cl-loop for (key request) on input-requests by #'cddr
              do (let ((method (plist-get request :method)))
                   (pcase method
                     ("roots/list"
                      (setq responses (append responses
-                                             (list key (mcp--roots-result connection)))))
+                                             (list key (mcp--roots-result roots)))))
                     (_ (signal 'mcp-input-required
                                (format "server asked for %s, which this client cannot provide"
                                        method))))))
     responses))
 
-(defun mcp--mrtr-retry-params (connection params result)
+(defun mcp--mrtr-retry-params (roots params result)
   "Return PARAMS extended with the answers RESULT asks for.
-CONNECTION supplies the client input, such as its roots."
+ROOTS holds the client roots to offer."
   (let ((requests (plist-get result :inputRequests))
         (state (plist-get result :requestState)))
     (append (mcp--params-to-plist params)
             (when requests
-              (list :inputResponses (mcp--mrtr-responses connection requests)))
+              (list :inputResponses (mcp--mrtr-responses roots requests)))
             ;; The server's opaque state must come back untouched, and must
             ;; not appear when the server sent none.
             (when state
@@ -559,7 +558,7 @@ Return the final complete result."
         (when (> round mcp--mrtr-max-rounds)
           (signal 'mcp-input-required
                   (format "%s asked for input %d times" method round)))
-        (setq params (mcp--mrtr-retry-params connection params result))))))
+        (setq params (mcp--mrtr-retry-params (mcp--roots connection) params result))))))
 
 (defun mcp--request-with-input-async (connection method params callback error-callback)
   "Send METHOD to CONNECTION with PARAMS asynchronously.
@@ -578,7 +577,7 @@ a message, including when the requested input cannot be provided."
                              (signal 'mcp-input-required
                                      (format "%s asked for input %d times"
                                              method (1+ round)))
-                           (send (mcp--mrtr-retry-params connection params result)
+                           (send (mcp--mrtr-retry-params (mcp--roots connection) params result)
                                  (1+ round)))
                        (mcp-input-required
                         (funcall error-callback mcp--input-required-code

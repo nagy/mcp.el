@@ -38,8 +38,10 @@ The repo is a Nix flake.
 
 ```bash
 nix build                 # melpaBuild: byte-compile with warnings as errors
-nix flake check           # evaluates packages and checks
+nix flake check           # builds the package and runs the ERT unit tests
 nix develop               # Emacs 31.1 plus jsonrpc, curl, plz in PATH
+make test                 # ERT unit tests, no network and no subprocesses
+make compile              # byte-compile with warnings as errors
 git diff --no-ext-diff    # always diff without external tools
 ```
 
@@ -63,7 +65,6 @@ Byte-compilation warnings are errors. Never relax that.
 
 ## TODO
 
-- [ ] Add ERT tests and a `checks.ert` derivation (unit tests only, no network).
 - [ ] Full lint gate in the flake: `checkdoc` plus `package-lint` with dependency
       stubs. Currently only byte-compilation guards the tree.
 - [ ] Streamable HTTP over `plz` with an incremental SSE parser.

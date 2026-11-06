@@ -205,8 +205,8 @@ what `json-serialize' writes as an object key."
                (let ((key (cond ((keywordp key) key)
                                 ((symbolp key) (intern (concat ":" (symbol-name key))))
                                 (t (intern (concat ":" (format "%s" key)))))))
-                 (push value plist)
-                 (push key plist)))
+                 (push key plist)
+                 (push value plist)))
              table)
     (nreverse plist)))
 
@@ -259,13 +259,14 @@ this client only."
                          :false-object :json-false)
     (json-parse-error
      (jsonrpc--warn "Invalid JSON: %s\t %s" (cdr err) string)
-     nil)))
+     nil)
+    (json-end-of-file nil)))
 
 (defun mcp--sse-payloads (body)
   "Return the data payload of each event in the server-sent event BODY."
   (let (payloads
         (data nil))
-    (dolist (line (split-string body "\r\n\|\n"))
+    (dolist (line (split-string body "\r\n\\|\n"))
       (cond
        ((string-empty-p (string-trim line))
         (when data

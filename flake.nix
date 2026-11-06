@@ -38,6 +38,14 @@
           # already packages.  The header asks for jsonrpc 1.0.25 and nixpkgs
           # ships 1.0.29, which satisfies it.
           emacsDeps = with pkgs.emacsPackages; [ jsonrpc ];
+          # Emacs with the dependencies on EMACSLOADPATH, for batch test runs.
+          emacs = pkgs.emacsPackages.emacsWithPackages (_: emacsDeps);
+          # Byte-compiled leftovers from a local session must never shadow the
+          # sources the tests load.
+          src = lib.cleanSourceWith {
+            src = ./.;
+            filter = path: type: !(lib.hasSuffix ".elc" path);
+          };
         in
         {
           packages.mcp = melpaBuild {
@@ -80,6 +88,19 @@
           };
 
           packages.default = config.packages.mcp;
+
+          # Unit tests: request metadata, HTTP body readers, MRTR helpers.
+          # No network access and no subprocesses.
+          checks.ert = pkgs.runCommand "mcp-ert" {
+            nativeBuildInputs = [ emacs ];
+            inherit src;
+          } ''
+            export HOME=$TMPDIR
+            emacs --batch --eval "(require 'package)" -f package-initialize \
+              -L "$src" -L "$src/test" -l ert -l mcp-test.el \
+              -f ert-run-tests-batch-and-exit
+            touch $out
+          '';
 
           devShells.default = pkgs.mkShell {
             # Emacs is 31.1 here while the package header keeps a 30.1 floor:
