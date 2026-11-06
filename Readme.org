@@ -5,6 +5,8 @@
 
 This is an Emacs client for interfacing with [[https://modelcontextprotocol.io/introduction][MCP]], supporting connections to MCP servers.
 
+It speaks the stateless [[https://modelcontextprotocol.io/specification/2026-07-28/changelog][2026-07-28 protocol revision]]: every request carries its protocol version and client capabilities, servers no longer keep a protocol session, and the initialize handshake is gone.
+
 * Features
 - Structured communication with MCP servers
 - Support for filesystem and generic MCP servers
@@ -15,7 +17,8 @@ This is an Emacs client for interfacing with [[https://modelcontextprotocol.io/i
 - Integration with popular Emacs packages (e.g., gptel, llm)
 
 * Installation
-Need Emacs 30 or higher version
+Needs Emacs 30.1 or later, the =jsonrpc= and =plz= packages, and =curl= on
+=exec-path= for HTTP servers.
 #+begin_src elisp
   (use-package mcp
     :ensure t
@@ -25,7 +28,7 @@ Need Emacs 30 or higher version
                                 :args ("-y" "@modelcontextprotocol/server-filesystem")
                                 :roots ("/home/lizqwer/MyProject/")))
                ("fetch" . (:command "uvx" :args ("mcp-server-fetch")))
-               ("qdrant" . (:url "http://localhost:8000/sse"))
+               ("qdrant" . (:url "http://localhost:8000/mcp"))
                ("graphlit" . (
                               :command "npx"
                               :args ("-y" "graphlit-mcp-server")
@@ -45,7 +48,7 @@ Need Emacs 30 or higher version
                            :args ("-y" "@modelcontextprotocol/server-filesystem")
                            :roots ("/home/lizqwer/MyProject/")))
           ("fetch" . (:command "uvx" :args ("mcp-server-fetch")))
-          ("qdrant" . (:url "http://localhost:8000/sse"))
+          ("qdrant" . (:url "http://localhost:8000/mcp"))
           ("graphlit" . (
                           :command "npx"
                           :args ("-y" "graphlit-mcp-server")
@@ -101,7 +104,11 @@ Use =mcp-hub= to launch the server management interface, which will automaticall
                           (message "%s resources: %s" (jsonrpc-name connection) resources)))
 #+end_src
 *** Using Roots with Filesystem Server
-The filesystem server uses the MCP roots protocol to determine which directories it can access. Instead of passing directories as command-line arguments, you can specify them using the =:roots= parameter:
+The filesystem server asks for roots to know which directories it may
+access.  In this revision the client offers them inside a multi
+round-trip request: the server answers a tool call or resource read with
+=resultType: "input_required"=, and the client retries with the roots it
+holds.  Configure them with the =:roots= parameter:
 
 #+begin_src elisp
   (mcp-connect-server "filesystem" 
@@ -125,6 +132,10 @@ You can also dynamically manage roots after the server is connected:
   ;; View current roots
   (mcp-get-roots "filesystem")
 #+end_src
+
+Changing roots after connecting only updates the local list.  The
+protocol removed =notifications/roots/list_changed=, so a server sees the
+new list the next time it asks for roots.
 
 Roots can also be specified as plists with additional metadata:
 #+begin_src elisp
@@ -217,8 +228,45 @@ Since the [[https://github.com/modelcontextprotocol/servers/tree/main/src/filesy
                                        #'(lambda (connection templates)
                                            (message "%s" templates))))
 #+end_src
+** Cancelling a request
+Async requests can be withdrawn with =mcp-cancel-request=.  Over stdio
+this sends =notifications/cancelled=; over HTTP it closes the response
+stream.  A cancelled tool call may still have run on the server, so do not
+retry one that changes state without asking the user first.
+#+begin_src elisp
+  (let ((connection (gethash "filesystem" mcp-server-connections)))
+    (mcp-cancel-request connection request-id "user quit"))
+#+end_src
+* Protocol notes
+- The client sends =2026-07-28= and reports the versions a server accepts
+  when the server rejects it.  Servers that still require the initialize
+  handshake are not supported.
+- =ping=, =logging/setLevel= and =notifications/roots/list_changed= no
+  longer exist, so their wrappers are gone.
+- Servers no longer send requests of their own, so the
+  =mcp-request-dispatcher= hook is replaced by an explicit rejection.  Client
+  input arrives inside a result instead.
+- =tools/call=, =prompts/get= and =resources/read= may return an interim
+  result that asks for client input.  The client answers what it can
+  (roots) and retries; anything else raises =mcp-input-required=.
+- Streamable HTTP requests carry =MCP-Protocol-Version=, =Mcp-Method= and,
+  where applicable, =Mcp-Name=.  Tool parameters annotated with
+  =x-mcp-header= travel as =Mcp-Param-*= headers, and tools whose
+  annotations break the rules are left out of =tools/list=.
+- List results are paged and cached while their declared =ttlMs= stays
+  fresh.  Change notifications invalidate the cache and reload the list.
+* Development
+The repository is a Nix flake with an ERT suite.
+#+begin_src sh
+  nix flake check   # package plus unit tests
+  nix develop       # Emacs, jsonrpc, plz and curl
+  make test         # unit tests without Nix
+#+end_src
 * Roadmap
 - [X] HTTP SSE based MCP server connections
+- [X] Stateless 2026-07-28 protocol revision
+- [X] Streamable HTTP with streamed responses
+- [X] Multi round-trip requests, pagination and list caching
 - [ ] mcp marketplace (browser and auto install mcp server)
 - [ ] Simplified integration with other Emacs AI clients
 - [ ] Expanded documentation
