@@ -48,20 +48,8 @@
 (require 'url)
 (require 'mcp-transport)
 
-(defconst mcp--support-versions (list "2025-03-26" "2024-11-05")
-  "MCP support version.")
-
 (defcustom mcp-server-start-time 60
   "The Seconds of mcp server start time."
-  :group 'mcp
-  :type 'integer)
-
-(defcustom mcp-server-wait-initial-time 2
-  "Seconds to wait after server init before fetching MCP resources.
-
-This delay is applied after server initialization completes, but
-before requesting tools, prompts and resources. Gives the server
-time to fully initialize all components before handling requests."
   :group 'mcp
   :type 'integer)
 
@@ -187,72 +175,102 @@ Returns nil if URL is invalid or not HTTP/HTTPS."
                         80))
               :path filename)))))
 
-(defun mcp--send-initial-message (connection &optional check-sse syncp)
-  "Send initialization message to MCP server CONNECTION.
+(defun mcp--discover (connection syncp callback error-callback)
+  "Ask CONNECTION which protocol versions and capabilities it supports.
+CALLBACK receives the result plist.  ERROR-CALLBACK receives a code
+and a message.
 
-This function sends the initial handshake message to establish communication
-with the MCP server. It is called internally during server connection setup.
+`server/discover' is an ordinary request, not a handshake.  A modern
+server answers it from scratch, and the answer also gives us the
+server identity that the removed `initialize' response used to carry."
+  (let* ((request-args `(,connection
+                         :server/discover
+                         nil
+                         :timeout ,mcp-server-start-time))
+         (async-args (append request-args
+                             (list :success-fn callback
+                                   :error-fn
+                                   (jsonrpc-lambda (&key code message _data)
+                                     (funcall error-callback code message))
+                                   :timeout-fn
+                                   (lambda ()
+                                     (funcall error-callback 124 "timeout"))))))
+    (if syncp
+        (condition-case-unless-debug err
+            (progn
+              (funcall callback (apply #'jsonrpc-request request-args))
+              t)
+          (jsonrpc-error
+           (pcase err
+             (`(jsonrpc-error ,_ (jsonrpc-error-code . ,code) (jsonrpc-error-message . ,message) ,_)
+              (funcall error-callback code message))
+             (`(jsonrpc-error ,_ (jsonrpc-error-message . "Timed out"))
+              (funcall error-callback 124 "timeout")))
+           nil))
+      (apply #'jsonrpc-async-request async-args))))
 
-CONNECTION is the MCP connection object representing the server connection.
-CHECK-SSE is an optional boolean flag indicating whether to verify is SSE
-mcp server before sending.
-SYNCP specifies if the operation should be synchronous or asynchronous."
-  (let* ((init-fn (if syncp #'mcp-sync-initialize-message #'mcp-async-initialize-message))
-         (callback-fn (lambda (protocolVersion serverInfo capabilities)
-                        (if (cl-find protocolVersion mcp--support-versions :test #'string=)
-                            (progn
-                              (message "[mcp] Connected! Server `MCP (%s)' now managing." (jsonrpc-name connection))
-                              (setf (mcp--capabilities connection) capabilities
-                                    (mcp--server-info connection) serverInfo)
-                              ;; Notify server initialized
-                              (mcp-notify connection
-                                          :notifications/initialized)
-                              (when (mcp--initial-callback connection)
-                                (funcall (mcp--initial-callback connection) connection))
-                              (let* ((capability-handlers
-                                      (lambda ()
-                                        ;; Handle logging
-                                        (when (plist-member capabilities :logging)
-                                          (funcall (if syncp #'mcp-sync-set-log-level #'mcp-async-set-log-level) connection mcp-log-level))
-                                        ;; Get prompts
-                                        (when (plist-member capabilities :prompts)
-                                          (funcall (if syncp #'mcp-sync-list-prompts #'mcp-async-list-prompts) connection (mcp--prompts-callback connection)))
-                                        ;; Get tools
-                                        (when (plist-member capabilities :tools)
-                                          (funcall (if syncp #'mcp-sync-list-tools #'mcp-async-list-tools) connection (mcp--tools-callback connection)))
-                                        ;; Get resources
-                                        (when (plist-member capabilities :resources)
-                                          (funcall (if syncp #'mcp-sync-list-resources #'mcp-async-list-resources) connection (mcp--resources-callback connection)))
-                                        ;; Get templace resources
-                                        (when (plist-member capabilities :resources)
-                                          (funcall (if syncp #'mcp-sync-list-resource-templates #'mcp-async-list-resource-templates) connection (mcp--resources-templates-callback connection))))))
-                                (if (not syncp)
-                                    (run-with-idle-timer mcp-server-wait-initial-time
-                                                         nil
-                                                         capability-handlers)
-                                  (sit-for mcp-server-wait-initial-time)
-                                  ;; REVIEW 2025-07-17: This needs to happen here,
-                                  ;;   because the following callbacks might rely
-                                  ;;   on the connection status.
-                                  (setf (mcp--status connection) 'connected)
-                                  (funcall capability-handlers)))
+(defun mcp--connect-failed (connection code message)
+  "Report CODE and MESSAGE for CONNECTION and stop it."
+  (mcp-stop-server (jsonrpc-name connection))
+  (setf (mcp--status connection) 'error)
+  (when (mcp--error-callback connection)
+    (funcall (mcp--error-callback connection) code message))
+  (message "Sadly, %s mpc server reports %s: %s"
+           (jsonrpc-name connection) code message))
 
-                              (setf (mcp--status connection) 'connected))
-                          (progn
-                            (message "[mcp] Error %s server protocolVersion(%s) not support, client Version: %s."
-                                     (jsonrpc-name connection)
-                                     protocolVersion
-                                     mcp--support-versions)
-                            (mcp-stop-server (jsonrpc-name connection))))))
-         (error-callback-fn (lambda (code message)
-                              (mcp-stop-server (jsonrpc-name connection))
-                              (setf (mcp--status connection) 'error)
-                              (when (mcp--error-callback connection)
-                                (funcall (mcp--error-callback connection) code message))
-                              (message "Sadly, %s mpc server reports %s: %s"
-                                       (jsonrpc-name connection) code message)))
-         (args `(,connection ,check-sse ,callback-fn ,error-callback-fn)))
-    (apply init-fn args)))
+(defun mcp--on-discovered (connection result syncp)
+  "Apply the `server/discover' RESULT to CONNECTION and load its lists."
+  (let* ((versions (append (plist-get result :supportedVersions) nil))
+         (capabilities (plist-get result :capabilities))
+         (server-info (plist-get (plist-get result :_meta)
+                                 :io.modelcontextprotocol/serverInfo)))
+    (if (not (member mcp--protocol-version versions))
+        (mcp--connect-failed connection
+                             -32022
+                             (format "server supports %s, client needs %s"
+                                     (if versions
+                                         (string-join versions ", ")
+                                       "no protocol version")
+                                     mcp--protocol-version))
+      (setf (mcp--capabilities connection) capabilities
+            (mcp--server-info connection) server-info
+            (mcp--instructions connection) (plist-get result :instructions)
+            ;; Connected before the callbacks run: they read the status.
+            (mcp--status connection) 'connected)
+      (message "[mcp] Connected! Server `MCP (%s)' now managing."
+               (jsonrpc-name connection))
+      (when (mcp--initial-callback connection)
+        (funcall (mcp--initial-callback connection) connection))
+      (mcp--fetch-capabilities connection syncp))))
+
+(defun mcp--fetch-capabilities (connection syncp)
+  "Fetch the lists advertised by the capabilities of CONNECTION."
+  (let ((capabilities (mcp--capabilities connection)))
+    (when (plist-member capabilities :prompts)
+      (funcall (if syncp #'mcp-sync-list-prompts #'mcp-async-list-prompts)
+               connection
+               (mcp--prompts-callback connection)))
+    (when (plist-member capabilities :tools)
+      (funcall (if syncp #'mcp-sync-list-tools #'mcp-async-list-tools)
+               connection
+               (mcp--tools-callback connection)))
+    (when (plist-member capabilities :resources)
+      (funcall (if syncp #'mcp-sync-list-resources #'mcp-async-list-resources)
+               connection
+               (mcp--resources-callback connection))
+      (funcall (if syncp #'mcp-sync-list-resource-templates #'mcp-async-list-resource-templates)
+               connection
+               (mcp--resources-templates-callback connection)))))
+
+(defun mcp--start-connection (connection syncp)
+  "Discover what CONNECTION supports, then load its lists.
+SYNCP selects the synchronous request path."
+  (mcp--discover connection
+                 syncp
+                 (lambda (result)
+                   (mcp--on-discovered connection result syncp))
+                 (lambda (code message)
+                   (mcp--connect-failed connection code message))))
 
 (defun mcp--server-running-p (name)
   "Return non-nil if server NAME is in running state."
@@ -374,15 +392,12 @@ in the `mcp-server-connections` hash table for future reference."
                                             :path (plist-get server-config :path)
                                             :token (plist-get server-config :token)
                                             :headers (plist-get server-config :headers)))))))
-        ;; Initialize connection
         (puthash name connection mcp-server-connections)
-        ;; Send the Initialize message
+        ;; Discover what the server supports, then load its lists.
         (let* ((msg-fn (lambda ()
                          (condition-case-unless-debug err
                              (if (jsonrpc-running-p connection)
-                                 (when (or (equal connection-type 'stdio)
-                                           (equal connection-type 'http))
-                                   (mcp--send-initial-message connection t syncp))
+                                 (mcp--start-connection connection syncp)
                                (error "Process start error"))
                            (error
                             (mcp-stop-server (jsonrpc-name connection))
@@ -614,86 +629,6 @@ On error, it displays an error message with the code from the server."
                          :error-fn (jsonrpc-lambda (&key code message _data)
                                      (message "Sadly, %s mpc server reports %s: %s"
                                               (jsonrpc-name connection) code message))))
-
-(defun mcp--initialize-message (connection _check-sse callback &optional error-callback syncp)
-  "Helper function to send an `initialize' request to the CONNECTION.
-
-CONNECTION is the MCP connection object.
-CHECK-SSE is an optional boolean flag indicating whether to verify is SSE
-mcp server before sending.
-CALLBACK is a function to call upon successful initialization.
-ERROR-CALLBACK is an optional function to call if an error occurs.
-SYNCP specifies if the operation should be synchronous or asynchronous.
-
-See `mcp-async-initialize-message' and `mcp-sync-initialize-message'."
-  (let* ((success-fn (lambda (res)
-                       (cl-destructuring-bind (&key protocolVersion serverInfo capabilities &allow-other-keys) res
-                         (funcall callback protocolVersion serverInfo capabilities))))
-         (error-fn (jsonrpc-lambda (&key code message _data)
-                     (if error-callback
-                         (funcall error-callback code message)
-                       (message "Sadly, %s mpc server reports %s: %s"
-                                (jsonrpc-name connection) code message))))
-         (timeout-fn (lambda ()
-                       (if error-callback
-                           (funcall error-callback 124 "timeout")
-                         (message "Sadly, mcp server (%s) timed out"
-                                  (jsonrpc-name connection)))))
-         (args `(,connection
-                 :initialize
-                 (:protocolVersion ,(car mcp--support-versions)
-                  :capabilities (:roots (:listChanged t))
-                  :clientInfo (:name "mcp-emacs" :version "0.1.0"))
-                 ,@(unless syncp `(:success-fn
-                                   ,success-fn))
-                 ,@(unless syncp `(:error-fn
-                                   ,error-fn))
-                 :timeout ,mcp-server-start-time
-                 ,@(unless syncp `(:timeout-fn
-                                   ,timeout-fn)))))
-    (if syncp
-        (condition-case-unless-debug res
-            (apply #'jsonrpc-request
-                   args)
-          (jsonrpc-error
-           (pcase res
-             (`(jsonrpc-error ,_ (jsonrpc-error-code . ,code) (jsonrpc-error-message . ,message) ,_)
-              (funcall error-fn (list :code code :message message))
-              nil)
-             (`(jsonrpc-error ,_ (jsonrpc-error-message . "Timed out"))
-              (funcall timeout-fn)
-              nil)))
-          (:success
-           (cl-destructuring-bind (&key protocolVersion serverInfo capabilities &allow-other-keys) res
-             (funcall callback protocolVersion serverInfo capabilities))))
-      (apply #'jsonrpc-async-request
-             args))))
-
-(defun mcp-async-initialize-message (connection check-sse callback &optional error-callback)
-  "Sending an `initialize' request to the CONNECTION.
-
-CONNECTION is the MCP connection object.
-CHECK-SSE is an optional boolean flag indicating whether to verify is SSE
-mcp server before sending.
-CALLBACK is a function to call upon successful initialization.
-ERROR-CALLBACK is an optional function to call if an error occurs.
-
-This function sends an `initialize' request to the server
-with the client's capabilities and version information."
-  (mcp--initialize-message connection check-sse callback error-callback))
-
-(defun mcp-sync-initialize-message (connection check-sse callback &optional error-callback)
-  "Sending an `initialize' request to the CONNECTION.
-
-CONNECTION is the MCP connection object.
-CHECK-SSE is an optional boolean flag indicating whether to verify is SSE
-mcp server before sending.
-CALLBACK is a function to call upon successful initialization.
-ERROR-CALLBACK is an optional function to call if an error occurs.
-
-This function sends an `initialize' request to the server
-with the client's capabilities and version information."
-  (mcp--initialize-message connection check-sse callback error-callback 'sync))
 
 (defun mcp--list-items (connection method key-name slot-name callback error-callback syncp)
   "Helper function to list items from the MCP server.

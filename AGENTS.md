@@ -66,7 +66,6 @@ Byte-compilation warnings are errors. Never relax that.
 - [ ] Add ERT tests and a `checks.ert` derivation (unit tests only, no network).
 - [ ] Full lint gate in the flake: `checkdoc` plus `package-lint` with dependency
       stubs. Currently only byte-compilation guards the tree.
-- [ ] Replace the handshake with `server/discover` bootstrap.
 - [ ] Streamable HTTP over `plz` with an incremental SSE parser.
 - [ ] MRTR support: `input_required` results and `inputResponses` retries.
 - [ ] Pagination plus `ttlMs` / `cacheScope` caching.

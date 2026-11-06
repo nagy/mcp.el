@@ -44,6 +44,9 @@
    (-serverinfo
     :initform nil
     :accessor mcp--server-info)
+   (-instructions
+    :initform nil
+    :accessor mcp--instructions)
    (-prompts
     :initform nil
     :accessor mcp--prompts)
