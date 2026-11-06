@@ -615,7 +615,7 @@ On error, it displays an error message with the code from the server."
                                      (message "Sadly, %s mpc server reports %s: %s"
                                               (jsonrpc-name connection) code message))))
 
-(defun mcp--initialize-message (connection check-sse callback &optional error-callback syncp)
+(defun mcp--initialize-message (connection _check-sse callback &optional error-callback syncp)
   "Helper function to send an `initialize' request to the CONNECTION.
 
 CONNECTION is the MCP connection object.
@@ -635,13 +635,10 @@ See `mcp-async-initialize-message' and `mcp-sync-initialize-message'."
                        (message "Sadly, %s mpc server reports %s: %s"
                                 (jsonrpc-name connection) code message))))
          (timeout-fn (lambda ()
-                       (unless (and check-sse
-                                    (mcp-http-process-connection-p connection)
-                                    (mcp--sse connection))
-                         (if error-callback
-                             (funcall error-callback 124 "timeout")
-                           (message "Sadly, mcp server (%s) timed out"
-                                    (jsonrpc-name connection))))))
+                       (if error-callback
+                           (funcall error-callback 124 "timeout")
+                         (message "Sadly, mcp server (%s) timed out"
+                                  (jsonrpc-name connection)))))
          (args `(,connection
                  :initialize
                  (:protocolVersion ,(car mcp--support-versions)
