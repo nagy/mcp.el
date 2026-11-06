@@ -53,27 +53,6 @@
   :group 'mcp
   :type 'integer)
 
-(defcustom mcp-log-level 'info
-  "The min log level for mcp server.
-Available levels:
-- debug: Detailed debugging information (function entry/exit points)
-- info: General informational messages (operation progress updates)
-- notice: Normal but significant events (configuration changes)
-- warning: Warning conditions (deprecated feature usage)
-- error: Error conditions (operation failures)
-- critical: Critical conditions (system component failures)
-- alert: Action must be taken immediately (data corruption detected)
-- emergency: System is unusable (complete system failure)"
-  :group 'mcp
-  :type '(choice (const :tag "debug" debug)
-          (const :tag "info" info)
-          (const :tag "notice" notice)
-          (const :tag "warning" warning)
-          (const :tag "error" error)
-          (const :tag "critical" critical)
-          (const :tag "alert" alert)
-          (const :tag "emergency" emergency)))
-
 (defcustom mcp-log-size nil
   "Maximum size for logging jsonrpc event.  0 disables, nil means infinite."
   :group 'mcp
@@ -561,93 +540,6 @@ the response to extract and return text content."
          :args
          (mcp--parse-tool-args properties (or required '())))))))
 
-(defun mcp--set-log-level (connection log-level syncp)
-  "Helper function to set the log level for the MCP server.
-
-CONNECTION is the MCP connection object.
-LOG-LEVEL is the desired log level.
-SYNCP specifies if the operation should be synchronous or asynchronous.
-
-See `mcp-async-set-log-level' and `mcp-sync-set-log-level'."
-  (let* ((success-fn (lambda (res)
-                       (message "[mcp] setLevel success: %s" res)))
-         (error-fn (jsonrpc-lambda (&key code message _data)
-                     (message "Sadly, %s mpc server reports %s: %s"
-                              (jsonrpc-name connection) code message)))
-         (args `(,connection
-                 :logging/setLevel
-                 ,(list :level (format "%s" log-level))
-                 :timeout ,(mcp--timeout connection)
-                 ,@(unless syncp `(:success-fn
-                                   ,success-fn))
-                 ,@(unless syncp `(:error-fn
-                                   ,error-fn)))))
-    (if syncp
-        (condition-case-unless-debug res
-            (apply #'jsonrpc-request
-                   args)
-          (jsonrpc-error
-           (pcase res
-             (`(jsonrpc-error ,_ (jsonrpc-error-code . ,code) (jsonrpc-error-message . ,message) ,_)
-              (funcall error-fn (list :code code :message message))
-              nil)))
-          (:success (funcall success-fn res) t))
-      (apply #'jsonrpc-async-request
-             args))))
-
-(defun mcp-async-set-log-level (connection log-level)
-  "Asynchronously set the log level for the MCP server.
-
-CONNECTION is the MCP connection object.
-LOG-LEVEL is the desired log level, which must be one of:
-- `debug': Detailed debugging information (function entry/exit points)
-- `info': General informational messages (operation progress updates)
-- `notice': Normal but significant events (configuration changes)
-- `warning': Warning conditions (deprecated feature usage)
-- `error': Error conditions (operation failures)
-- `critical': Critical conditions (system component failures)
-- `alert': Action must be taken immediately (data corruption detected)
-- `emergency': System is unusable (complete system failure)
-
-On success, displays a message confirming the log level change.
-On error, displays an error message with the server's response code and message."
-  (mcp--set-log-level connection log-level nil))
-
-(defun mcp-sync-set-log-level (connection log-level)
-  "Synchronously set the log level for the MCP server.
-
-CONNECTION is the MCP connection object.
-LOG-LEVEL is the desired log level, which must be one of:
-- `debug': Detailed debugging information (function entry/exit points)
-- `info': General informational messages (operation progress updates)
-- `notice': Normal but significant events (configuration changes)
-- `warning': Warning conditions (deprecated feature usage)
-- `error': Error conditions (operation failures)
-- `critical': Critical conditions (system component failures)
-- `alert': Action must be taken immediately (data corruption detected)
-- `emergency': System is unusable (complete system failure)
-
-On success, displays a message confirming the log level change.
-On error, displays an error message with the server's response code and message."
-  (mcp--set-log-level connection log-level 'sync))
-
-(defun mcp-async-ping (connection)
-  "Send an asynchronous ping request to the MCP server via CONNECTION.
-
-The function uses `jsonrpc-async-request' to send a ping request.
-On success, it displays a message with the response.
-On error, it displays an error message with the code from the server."
-  (jsonrpc-async-request connection
-                         :ping
-                         nil
-                         :timeout (mcp--timeout connection)
-                         :success-fn
-                         (lambda (res)
-                           (message "[mcp] ping success: %s" res))
-                         :error-fn (jsonrpc-lambda (&key code message _data)
-                                     (message "Sadly, %s mpc server reports %s: %s"
-                                              (jsonrpc-name connection) code message))))
-
 (defun mcp--list-items (connection method key-name slot-name callback error-callback syncp)
   "Helper function to list items from the MCP server.
 
@@ -847,15 +739,10 @@ Each root can be either:
 - A plist with :uri and :name
   (e.g., (:uri \"file:///home/user/project\" :name \"Project\"))
 
-After setting roots, sends a notification to the server that roots
-have changed."
+The list stays local until a server asks for it, which the modern
+protocol does through a multi round-trip request."
   (when-let* ((connection (gethash name mcp-server-connections)))
-    (condition-case err
-        (progn
-          (setf (mcp--roots connection) roots)
-          (mcp-notify connection :notifications/roots/list_changed))
-      (error
-       (message "Warning: Could not set roots for %s: %s. Server may need to be restarted." name err)))))
+    (setf (mcp--roots connection) roots)))
 
 (defun mcp-add-root (name root)
   "Add a ROOT to MCP server NAME.
@@ -866,16 +753,11 @@ ROOT can be either:
 - A plist with :uri and :name
   (e.g., (:uri \"file:///home/user/project\" :name \"Project\"))
 
-After adding the root, sends a notification to the server that roots
-have changed."
+The list stays local until a server asks for it."
   (when-let* ((connection (gethash name mcp-server-connections)))
-    (condition-case err
-        (let ((current-roots (mcp--roots connection)))
-          (unless (member root current-roots)
-            (setf (mcp--roots connection) (append current-roots (list root)))
-            (mcp-notify connection :notifications/roots/list_changed)))
-      (error
-       (message "Warning: Could not add root to %s: %s. Server may need to be restarted." name err)))))
+    (let ((current-roots (mcp--roots connection)))
+      (unless (member root current-roots)
+        (setf (mcp--roots connection) (append current-roots (list root)))))))
 
 (defun mcp-remove-root (name root)
   "Remove ROOT from MCP server NAME.
@@ -883,16 +765,10 @@ have changed."
 NAME is the server name (string).
 ROOT is the root to remove (string path or plist).
 
-After removing the root, sends a notification to the server that roots
-have changed."
+The list stays local until a server asks for it."
   (when-let* ((connection (gethash name mcp-server-connections)))
-    (condition-case err
-        (progn
-          (setf (mcp--roots connection)
-                (cl-remove root (mcp--roots connection) :test #'equal))
-          (mcp-notify connection :notifications/roots/list_changed))
-      (error
-       (message "Warning: Could not remove root from %s: %s. Server may need to be restarted." name err)))))
+    (setf (mcp--roots connection)
+          (cl-remove root (mcp--roots connection) :test #'equal))))
 
 (defun mcp-get-roots (name)
   "Get the current roots for MCP server NAME.
