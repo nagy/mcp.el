@@ -190,8 +190,8 @@ server identity that the removed `initialize' response used to carry."
          (async-args (append request-args
                              (list :success-fn callback
                                    :error-fn
-                                   (jsonrpc-lambda (&key code message _data)
-                                     (funcall error-callback code message))
+                                   (jsonrpc-lambda (&key code message data)
+                                     (funcall error-callback code message data))
                                    :timeout-fn
                                    (lambda ()
                                      (funcall error-callback 124 "timeout"))))))
@@ -202,21 +202,39 @@ server identity that the removed `initialize' response used to carry."
               t)
           (jsonrpc-error
            (pcase err
-             (`(jsonrpc-error ,_ (jsonrpc-error-code . ,code) (jsonrpc-error-message . ,message) ,_)
-              (funcall error-callback code message))
+             (`(jsonrpc-error ,_ (jsonrpc-error-code . ,code) (jsonrpc-error-message . ,message) (jsonrpc-error-data . ,data))
+              (funcall error-callback code message data))
              (`(jsonrpc-error ,_ (jsonrpc-error-message . "Timed out"))
-              (funcall error-callback 124 "timeout")))
+              (funcall error-callback 124 "timeout" nil)))
            nil))
       (apply #'jsonrpc-async-request async-args))))
 
-(defun mcp--connect-failed (connection code message)
-  "Report CODE and MESSAGE for CONNECTION and stop it."
+(defconst mcp--unsupported-protocol-version -32022
+  "JSON-RPC error code for a protocol version the server rejects.")
+
+(defun mcp--supported-versions-of (data)
+  "Return the supported protocol versions named in error DATA.
+DATA is the optional `data' member of a JSON-RPC error object."
+  (append (plist-get data :supported) nil))
+
+(defun mcp--connect-failed (connection code message &optional data)
+  "Report CODE and MESSAGE for CONNECTION and stop it.
+DATA is the optional error object payload.  For an unsupported protocol
+version it names the versions the server accepts, which is the only way
+the user learns what to aim for."
   (mcp-stop-server (jsonrpc-name connection))
   (setf (mcp--status connection) 'error)
-  (when (mcp--error-callback connection)
-    (funcall (mcp--error-callback connection) code message))
-  (message "Sadly, %s mpc server reports %s: %s"
-           (jsonrpc-name connection) code message))
+  (let* ((supported (mcp--supported-versions-of data))
+         (message (if (and (= code mcp--unsupported-protocol-version)
+                           supported)
+                      (format "%s (server supports: %s)"
+                              message
+                              (string-join supported ", "))
+                    message)))
+    (when (mcp--error-callback connection)
+      (funcall (mcp--error-callback connection) code message))
+    (message "Sadly, %s mpc server reports %s: %s"
+             (jsonrpc-name connection) code message)))
 
 (defun mcp--on-discovered (connection result syncp)
   "Apply the `server/discover' RESULT to CONNECTION and load its lists."
@@ -226,7 +244,7 @@ server identity that the removed `initialize' response used to carry."
                                  :io.modelcontextprotocol/serverInfo)))
     (if (not (member mcp--protocol-version versions))
         (mcp--connect-failed connection
-                             -32022
+                             mcp--unsupported-protocol-version
                              (format "server supports %s, client needs %s"
                                      (if versions
                                          (string-join versions ", ")
@@ -269,8 +287,8 @@ SYNCP selects the synchronous request path."
                  syncp
                  (lambda (result)
                    (mcp--on-discovered connection result syncp))
-                 (lambda (code message)
-                   (mcp--connect-failed connection code message))))
+                 (lambda (code message data)
+                   (mcp--connect-failed connection code message data))))
 
 (defun mcp--server-running-p (name)
   "Return non-nil if server NAME is in running state."
