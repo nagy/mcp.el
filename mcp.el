@@ -485,7 +485,7 @@ Returns the text, the JSON string, or nil when the result carries
 neither."
   (when (mcp--input-required-p res)
     (signal 'mcp-input-required
-            "tool call returned an interim result that asked for input"))
+            (list "tool call returned an interim result that asked for input")))
   (let ((text (string-join
                (cl-remove-if #'null
                              (mapcar (lambda (content)
@@ -564,8 +564,8 @@ capabilities it never declared."
                      (setq responses (append responses
                                              (list key (mcp--roots-result roots)))))
                     (_ (signal 'mcp-input-required
-                               (format "server asked for %s, which this client cannot provide"
-                                       method))))))
+                               (list (format "server asked for %s, which this client cannot provide"
+                                             method)))))))
     responses))
 
 (defun mcp--mrtr-retry-params (roots params result)
@@ -593,8 +593,9 @@ Return the final complete result."
         (setq round (1+ round))
         (when (> round mcp--mrtr-max-rounds)
           (signal 'mcp-input-required
-                  (format "%s asked for input %d times" method round)))
-        (setq params (mcp--mrtr-retry-params (mcp--roots connection) params result))))))
+                  (list (format "%s asked for input %d times" method round))))
+        (setq params (mcp--mrtr-retry-params (mcp--roots connection)
+                                             params result))))))
 
 (defun mcp--request-with-input-async (connection method params callback error-callback)
   "Send METHOD to CONNECTION with PARAMS asynchronously.
@@ -611,9 +612,10 @@ a message, including when the requested input cannot be provided."
                      (condition-case err
                          (if (>= round mcp--mrtr-max-rounds)
                              (signal 'mcp-input-required
-                                     (format "%s asked for input %d times"
-                                             method (1+ round)))
-                           (send (mcp--mrtr-retry-params (mcp--roots connection) params result)
+                                     (list (format "%s asked for input %d times"
+                                                   method (1+ round))))
+                           (send (mcp--mrtr-retry-params
+                                  (mcp--roots connection) params result)
                                  (1+ round)))
                        (mcp-input-required
                         (funcall error-callback mcp--input-required-code
@@ -776,6 +778,11 @@ Return the cached or fetched items, or nil when the request failed."
             (funcall callback connection cached-items))
           cached-items)
       (let* ((store (lambda (items ttl-ms)
+                      ;; The streamable HTTP transport must not offer a tool
+                      ;; whose header annotations it cannot honour.
+                      (when (and (equal method :tools/list)
+                                 (eq (mcp--connection-type connection) 'http))
+                        (setq items (mcp--validated-tools items)))
                       (setf (slot-value connection slot-name) items)
                       (mcp--list-cache-put connection method items ttl-ms)
                       (when callback

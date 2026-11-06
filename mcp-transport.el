@@ -419,6 +419,210 @@ A nil REQUEST-ID marks a notification, which expects no response."
           (when (buffer-live-p (process-buffer proc))
             (kill-buffer (process-buffer proc)))))))))
 
+;;; HTTP request headers
+
+;; The transport mirrors parts of the JSON-RPC body into headers so that
+;; intermediaries can route and observe requests without parsing the body.
+;; Values that cannot appear verbatim in a header travel as base64 between
+;; the markers below.
+
+(defconst mcp--header-sentinel-prefix "=?base64?"
+  "Marker that starts a base64-encoded header value.")
+
+(defconst mcp--header-sentinel-suffix "?="
+  "Marker that ends a base64-encoded header value.")
+
+(defconst mcp--methods-with-name '("tools/call" "prompts/get" "resources/read")
+  "Requests whose body carries a name or URI that mirrors into Mcp-Name.")
+
+(defun mcp--header-value (value)
+  "Return VALUE encoded for an MCP request header.
+Only visible ASCII, space and tab may appear verbatim.  Anything else,
+and any value that looks like the marker syntax itself, travels as
+base64 of its UTF-8 bytes."
+  (let ((string (format "%s" value)))
+    (if (or (string-match-p "[^\t !-~]" string)
+            (and (string-prefix-p mcp--header-sentinel-prefix string)
+                 (string-suffix-p mcp--header-sentinel-suffix string)))
+        (format "%s%s%s"
+                mcp--header-sentinel-prefix
+                (base64-encode-string (encode-coding-string string 'utf-8) t)
+                mcp--header-sentinel-suffix)
+      string)))
+
+;;; Tool parameters mirrored into headers
+
+;; A server may mark tool parameters with x-mcp-header, and the client must
+;; then send those argument values as Mcp-Param-{name} headers.  A tool whose
+;; annotations break the rules must not appear in tools/list at all.
+
+(define-error 'mcp-invalid-tool "MCP tool definition rejected")
+
+(defun mcp--valid-header-name-p (name)
+  "Return non-nil when NAME is an HTTP field-name token.
+Token characters come from RFC 9110 section 5.1."
+  (and (stringp name)
+       (not (string-empty-p name))
+       (let ((start (string-match "[!#$%&'*+.^_`|~0-9A-Za-z-]+" name)))
+         (and (eq start 0)
+              (= (match-end 0) (length name))))))
+
+(defconst mcp--header-integer-limit 9007199254740991
+  "Largest integer JavaScript represents exactly.")
+
+(defun mcp--schema-annotation-count (node)
+  "Count every x-mcp-header key in NODE at any depth."
+  (cond
+   ((vectorp node)
+    (cl-loop for item across node
+             sum (mcp--schema-annotation-count item)))
+   ((and (consp node) (keywordp (car node)))
+    (cl-loop for (key value) on node by #'cddr
+             sum (+ (if (eq key :x-mcp-header) 1 0)
+                    (mcp--schema-annotation-count value))))
+   (t 0)))
+
+(defun mcp--property-annotations (schema path)
+  "Collect (PATH . NAME) for x-mcp-header annotations in SCHEMA.
+PATH is the property chain from the schema root.  Only chains of
+`properties' keys are followed, which is what the specification calls
+statically reachable."
+  (let (annotations
+        (properties (plist-get schema :properties)))
+    (cl-loop for (key value) on properties by #'cddr
+             do (let ((header (plist-get value :x-mcp-header))
+                      (sub-path (append path (list key))))
+                  (when header
+                    (push (cons sub-path header) annotations))
+                  (when (plist-get value :properties)
+                    (setq annotations
+                          (append (mcp--property-annotations value sub-path)
+                                  annotations)))))
+    annotations))
+
+(defun mcp--schema-at-path (schema path)
+  "Return the subschema of SCHEMA at PATH."
+  (let ((node schema))
+    (dolist (key path node)
+      (setq node (plist-get (plist-get node :properties) key)))))
+
+(defun mcp--invalid-tool (format-string &rest args)
+  "Signal `mcp-invalid-tool' with FORMAT-STRING and ARGS."
+  (signal 'mcp-invalid-tool (list (apply #'format format-string args))))
+
+(defun mcp--check-header-name (name tool-name)
+  "Signal unless NAME is a usable header name for TOOL-NAME."
+  (unless (mcp--valid-header-name-p name)
+    (mcp--invalid-tool "tool %s annotates a parameter with an invalid header name %S"
+                       tool-name name)))
+
+(defun mcp--check-header-type (schema name tool-name)
+  "Signal unless the type of SCHEMA suits a header called NAME.
+TOOL-NAME names the tool under inspection."
+  (let ((type (plist-get schema :type)))
+    (unless (member type '("string" "boolean" "integer"))
+      (mcp--invalid-tool
+       "tool %s mirrors %s into a header but its type %S cannot be sent"
+       tool-name name (or type "missing")))))
+
+(defun mcp--tool-header-fields (tool)
+  "Return (PATH . HEADER-NAME) pairs for the x-mcp-header of TOOL.
+Signal `mcp-invalid-tool' when an annotation breaks a rule, which makes
+the whole tool definition invalid."
+  (let* ((tool-name (plist-get tool :name))
+         (schema (plist-get tool :inputSchema))
+         (annotations (mcp--property-annotations schema nil))
+         (names nil))
+    (unless (= (length annotations)
+               (mcp--schema-annotation-count schema))
+      (mcp--invalid-tool
+       "tool %s annotates a parameter that is not statically reachable"
+       tool-name))
+    (dolist (annotation annotations)
+      (let ((name (cdr annotation)))
+        (mcp--check-header-name name tool-name)
+        (mcp--check-header-type (mcp--schema-at-path schema (car annotation))
+                                name tool-name)
+        (push name names)))
+    (unless (= (length names)
+               (length (delete-dups (mapcar #'downcase names))))
+      (mcp--invalid-tool
+       "tool %s uses one header name for different parameters"
+       tool-name))
+    annotations))
+
+(defun mcp--validated-tools (tools)
+  "Return TOOLS without definitions the transport must reject.
+TOOLS is a vector of tool definitions."
+  (let ((kept []))
+    (dolist (tool (append tools nil))
+      (condition-case err
+          (progn
+            (mcp--tool-header-fields tool)
+            (setq kept (vconcat kept (vector tool))))
+        (error
+         (message "[mcp] rejecting tool %s: %s"
+                  (plist-get tool :name)
+                  (error-message-string err)))))
+    kept))
+
+(defun mcp--path-value (arguments path)
+  "Return the value of PATH inside ARGUMENTS, or nil when absent."
+  (let ((node arguments))
+    (dolist (key path node)
+      (setq node (and (consp node) (plist-get node key))))))
+
+(defun mcp--header-mirrorable-p (value name tool-name)
+  "Return non-nil when VALUE may travel in the header called NAME.
+Only values JavaScript represents exactly may be mirrored, so an integer
+beyond that range is dropped with a warning instead of being sent."
+  (cond
+   ((null value) nil)
+   ((integerp value)
+    (if (<= (abs value) mcp--header-integer-limit)
+        t
+      (message "[mcp] not mirroring %s of %s into %s: outside the safe integer range"
+               value tool-name name)
+      nil))
+   (t t)))
+
+(defun mcp--tool-param-headers (connection tool-name arguments)
+  "Return Mcp-Param headers for TOOL-NAME called with ARGUMENTS.
+TOOL-NAME is looked up in the tools of CONNECTION, which carry the
+annotations that name each header."
+  (when-let* ((tool (cl-find tool-name
+                            (mcp--tools connection)
+                            :test #'equal
+                            :key (lambda (tool) (plist-get tool :name)))))
+    (cl-loop for (path . name) in (mcp--tool-header-fields tool)
+             for value = (mcp--path-value arguments path)
+             when (mcp--header-mirrorable-p value name tool-name)
+             collect (cons (concat "Mcp-Param-" name)
+                           (mcp--header-value value)))))
+
+(defun mcp--http-headers (connection args)
+  "Return the request headers for ARGS on CONNECTION.
+ARGS holds the JSON-RPC method, parameters and id of the message."
+  (let* ((method (plist-get args :method))
+         (params (plist-get args :params))
+         (name (when (member method mcp--methods-with-name)
+                 (or (plist-get params :name)
+                     (plist-get params :uri)))))
+    (append
+     '(("Content-Type" . "application/json")
+       ("Accept" . "application/json, text/event-stream"))
+     (list (cons "MCP-Protocol-Version" mcp--protocol-version)
+           (cons "Mcp-Method" method))
+     (when name
+       (list (cons "Mcp-Name" (mcp--header-value name))))
+     (when-let* ((token (mcp--resolve-value (mcp--token connection))))
+       (list (cons "Authorization" (concat "Bearer " token))))
+     (mcp--headers connection)
+     (when (equal method "tools/call")
+       (mcp--tool-param-headers connection
+                                (plist-get params :name)
+                                (plist-get params :arguments))))))
+
 (defun mcp--http-post (connection body headers request-id)
   "POST BODY to CONNECTION with HEADERS.
 REQUEST-ID identifies the request the response carries, or nil for a
@@ -499,13 +703,7 @@ The message is sent differently based on connection type:
       ('http
        (mcp--http-post connection
                        json
-                       (append '(("Content-Type" . "application/json")
-                                 ("Accept" . "application/json, text/event-stream"))
-                               (list (cons "MCP-Protocol-Version"
-                                           mcp--protocol-version))
-                               (when-let* ((token (mcp--resolve-value (mcp--token connection))))
-                                 (list (cons "Authorization" (concat "Bearer " token))))
-                               (mcp--headers connection))
+                       (mcp--http-headers connection args)
                        (plist-get args :id)))
       ('stdio
        (process-send-string

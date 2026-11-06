@@ -283,6 +283,140 @@
         (should (equal (append items nil) '((:name "cached"))))
         (should (equal (append (mcp--tools conn) nil) '((:name "cached"))))))))
 
+;;;; HTTP request headers
+
+(defun mcp-test--tool (name schema)
+  "Return a tool definition called NAME with SCHEMA."
+  (list :name name :description name :inputSchema schema))
+
+(defun mcp-test--schema (&rest properties)
+  "Return an object schema with PROPERTIES."
+  (list :type "object" :properties (append properties nil)))
+
+(ert-deftest mcp-test-header-value-plain ()
+  "Header-safe values travel verbatim."
+  (should (equal (mcp--header-value "us-west1") "us-west1"))
+  (should (equal (mcp--header-value "with space") "with space")))
+
+(ert-deftest mcp-test-header-value-non-ascii ()
+  "Non-ASCII values travel as base64 between the markers."
+  (should (equal (mcp--header-value "Hello, 世界")
+                 "=?base64?SGVsbG8sIOS4lueVjA==?=")))
+
+(ert-deftest mcp-test-header-value-sentinel-shaped ()
+  "A value that looks like an encoded value is encoded too."
+  (should (equal (mcp--header-value "=?base64?literal?=")
+                 "=?base64?PT9iYXNlNjQ/bGl0ZXJhbD89?=")))
+
+(ert-deftest mcp-test-valid-header-name ()
+  "Field names follow token syntax."
+  (should (mcp--valid-header-name-p "Region"))
+  (should (mcp--valid-header-name-p "x-tenant_id.v2"))
+  (should-not (mcp--valid-header-name-p ""))
+  (should-not (mcp--valid-header-name-p "has space"))
+  (should-not (mcp--valid-header-name-p "colon:name")))
+
+(ert-deftest mcp-test-tool-header-fields-valid ()
+  "Annotations reachable through properties are accepted."
+  (let* ((schema (mcp-test--schema
+                  :region (list :type "string" :x-mcp-header "Region")
+                  :query (list :type "string")))
+         (fields (mcp--tool-header-fields (mcp-test--tool "sql" schema))))
+    (should (equal fields '(((:region) . "Region"))))))
+
+(ert-deftest mcp-test-tool-header-fields-nested ()
+  "Nested object properties stay statically reachable."
+  (let* ((schema (mcp-test--schema
+                  :outer (list :type "object"
+                               :properties (list :inner (list :type "string"
+                                                              :x-mcp-header "Inner")))))
+         (fields (mcp--tool-header-fields (mcp-test--tool "t" schema))))
+    (should (equal fields '(((:outer :inner) . "Inner"))))))
+
+(ert-deftest mcp-test-tool-header-fields-unreachable ()
+  "An annotation under items is invalid, so the tool is invalid."
+  (let ((schema (mcp-test--schema
+                 :rows (list :type "array"
+                             :items (list :type "object"
+                                          :properties (list :id (list :type "string"
+                                                                      :x-mcp-header "Id")))))))
+    (should (eq t (condition-case nil
+                      (progn (mcp--tool-header-fields (mcp-test--tool "t" schema)) nil)
+                    (mcp-invalid-tool t))))))
+
+(ert-deftest mcp-test-tool-header-fields-bad-type ()
+  "Only string, boolean and integer parameters may become headers."
+  (let ((schema (mcp-test--schema
+                 :ratio (list :type "number" :x-mcp-header "Ratio"))))
+    (should (eq t (condition-case nil
+                      (progn (mcp--tool-header-fields (mcp-test--tool "t" schema)) nil)
+                    (mcp-invalid-tool t))))))
+
+(ert-deftest mcp-test-tool-header-fields-duplicate ()
+  "Two parameters may not share a header name, ignoring case."
+  (let ((schema (mcp-test--schema
+                 :a (list :type "string" :x-mcp-header "Same")
+                 :b (list :type "integer" :x-mcp-header "same"))))
+    (should (eq t (condition-case nil
+                      (progn (mcp--tool-header-fields (mcp-test--tool "t" schema)) nil)
+                    (mcp-invalid-tool t))))))
+
+(ert-deftest mcp-test-validated-tools-drops-invalid ()
+  "Invalid definitions are dropped, valid ones survive."
+  (let* ((good (mcp-test--tool "good" (mcp-test--schema :r (list :type "string"))))
+         (bad (mcp-test--tool "bad" (mcp-test--schema
+                                     :n (list :type "number" :x-mcp-header "N"))))
+         (kept (cl-letf (((symbol-function 'message) #'ignore))
+                 (mcp--validated-tools (vector good bad)))))
+    (should (= 1 (length kept)))
+    (should (equal (plist-get (aref kept 0) :name) "good"))))
+
+(ert-deftest mcp-test-http-headers ()
+  "Standard and parameter headers mirror the request body."
+  (let* ((conn (mcp-test--connection))
+         (tool (mcp-test--tool "execute_sql"
+                               (mcp-test--schema
+                                :region (list :type "string" :x-mcp-header "Region"))))
+         (_ (setf (mcp--tools conn) (vector tool)))
+         (headers (mcp--http-headers
+                   conn
+                   (list :method "tools/call"
+                         :params (list :name "execute_sql"
+                                       :arguments (list :region "us-west1")))))
+         (get (lambda (name) (cdr (assoc name headers)))))
+    (should (equal (funcall get "Mcp-Method") "tools/call"))
+    (should (equal (funcall get "Mcp-Name") "execute_sql"))
+    (should (equal (funcall get "Mcp-Param-Region") "us-west1"))
+    (should (equal (funcall get "MCP-Protocol-Version") "2026-07-28"))))
+
+(ert-deftest mcp-test-http-headers-omit-unsafe-integer ()
+  "An integer JavaScript cannot represent is not mirrored."
+  (let* ((conn (mcp-test--connection))
+         (tool (mcp-test--tool "scaled"
+                               (mcp-test--schema
+                                :weight (list :type "integer" :x-mcp-header "Weight")))))
+    (setf (mcp--tools conn) (vector tool))
+    (let ((headers (cl-letf (((symbol-function 'message) #'ignore))
+                     (mcp--http-headers
+                      conn
+                      (list :method "tools/call"
+                            :params (list :name "scaled"
+                                          :arguments (list :weight 9007199254740992)))))))
+      (should-not (assoc "Mcp-Param-Weight" headers)))))
+
+(ert-deftest mcp-test-http-headers-omit-missing-param ()
+  "A parameter with no value produces no header."
+  (let* ((conn (mcp-test--connection))
+         (tool (mcp-test--tool "execute_sql"
+                               (mcp-test--schema
+                                :region (list :type "string" :x-mcp-header "Region")))))
+    (setf (mcp--tools conn) (vector tool))
+    (let ((headers (mcp--http-headers
+                    conn
+                    (list :method "tools/call"
+                          :params (list :name "execute_sql" :arguments (list))))))
+      (should-not (assoc "Mcp-Param-Region" headers)))))
+
 ;;;; Error helpers
 
 (ert-deftest mcp-test-supported-versions-of ()
