@@ -75,30 +75,30 @@ than a request."
 (defvar mcp-server-connections (make-hash-table :test #'equal)
   "Mcp server process.")
 
-(defun mcp-request-dispatcher (name method params)
-  "Default handler for MCP server requests.
-NAME identifies the server connection. METHOD is the requested
-method name. PARAMS contains the method parameters.
+(defun mcp--roots-result (connection)
+  "Return the roots of CONNECTION as a ListRootsResult plist."
+  (let ((roots (condition-case nil
+                   (mcp--roots connection)
+                 (error nil))))
+    (list :roots
+          (if roots
+              (vconcat (mapcar (lambda (root)
+                                 (if (stringp root)
+                                     (list :uri (concat "file://" (expand-file-name root))
+                                           :name (file-name-nondirectory
+                                                  (directory-file-name root)))
+                                   root))
+                               roots))
+            []))))
 
-This basic implementation just logs the request. Applications
-should override this to implement actual request handling."
-  (pcase method
-    ('roots/list
-     (if-let* ((connection (gethash name mcp-server-connections)))
-         (let ((roots (condition-case nil
-                          (mcp--roots connection)
-                        (error nil))))
-           (list :roots (if roots
-                            (vconcat (mapcar (lambda (root)
-                                               (if (stringp root)
-                                                   (list :uri (concat "file://" (expand-file-name root))
-                                                         :name (file-name-nondirectory (directory-file-name root)))
-                                                 root))
-                                             roots))
-                          [])))
-       (list :roots [])))
-    (_
-     (message "%s Received request: method=%s, params=%s" name method params))))
+(defun mcp--reject-server-request (name method _params)
+  "Refuse an unsolicited request from server NAME.
+The stateless revision replaced server-initiated requests with multi
+round-trip requests, so a server sending one contradicts the protocol
+version it answered with.  METHOD names the refused request."
+  (jsonrpc-error :code -32601
+                 :message (format "server %s sent %s, which this protocol revision does not allow"
+                                  name method)))
 
 (defun mcp-notification-dispatcher (connection name method params)
   "Handle notifications from MCP server.
@@ -371,7 +371,8 @@ in the `mcp-server-connections` hash table for future reference."
                                   :timeout ,(or timeout jsonrpc-default-request-timeout)
                                   :events-buffer-config (:size ,mcp-log-size)
                                   :request-dispatcher ,(lambda (_ method params)
-                                                         (funcall #'mcp-request-dispatcher name method params))
+                                                         (funcall #'mcp--reject-server-request
+                                                                  name method params))
                                   :notification-dispatcher ,(lambda (connection method params)
                                                               (funcall #'mcp-notification-dispatcher connection name method params))
                                   :on-shutdown ,(lambda (_)
@@ -454,6 +455,9 @@ The function extracts text content from the result, concatenating it into
 a single string if multiple text entries are present.
 
 Returns the concatenated text or nil if no text content is found."
+  (when (mcp--input-required-p res)
+    (signal 'mcp-input-required
+            "tool call returned an interim result that asked for input"))
   (string-join
    (cl-remove-if #'null
                  (mapcar (lambda (content)
@@ -486,6 +490,103 @@ Returns a plist of argument names and values ready for tool invocation."
                       (append args
                               (when (> need-length 0)
                                 (make-list need-length nil)))))))
+
+;;; Multi round-trip requests
+
+;; A server may answer tools/call, prompts/get or resources/read with
+;; resultType "input_required" instead of a result.  The client gathers
+;; the requested input, then repeats the request with the answers and the
+;; opaque requestState echoed back.  Every retry is a new JSON-RPC request:
+;; nothing about the original call survives on the server.
+
+(defconst mcp--mrtr-max-rounds 8
+  "How many times one request may answer server input requests.")
+
+;; Mirrors the server-side MissingRequiredClientCapability code.  It labels
+;; the error handed to `mcp-connect-server' style callbacks, not a message
+;; sent to the server.
+(defconst mcp--input-required-code -32021
+  "Error code reported when the client cannot provide requested input.")
+
+(define-error 'mcp-input-required
+  "MCP server requires client input that this client cannot provide")
+
+(defun mcp--input-required-p (result)
+  "Return non-nil when RESULT asks for more client input.
+Results from earlier revisions carry no `resultType' and mean complete."
+  (equal (plist-get result :resultType) "input_required"))
+
+(defun mcp--mrtr-responses (connection input-requests)
+  "Return responses for the INPUT-REQUESTS of a multi round-trip request.
+INPUT-REQUESTS maps server-chosen keys to request objects.  Signal
+`mcp-input-required' for a request this client cannot answer, which is
+only possible for capabilities it never declared."
+  (let (responses)
+    (cl-loop for (key request) on input-requests by #'cddr
+             do (let ((method (plist-get request :method)))
+                  (pcase method
+                    ("roots/list"
+                     (setq responses (append responses
+                                             (list key (mcp--roots-result connection)))))
+                    (_ (signal 'mcp-input-required
+                               (format "server asked for %s, which this client cannot provide"
+                                       method))))))
+    responses))
+
+(defun mcp--mrtr-retry-params (connection params result)
+  "Return PARAMS extended with the answers RESULT asks for.
+CONNECTION supplies the client input, such as its roots."
+  (let ((requests (plist-get result :inputRequests))
+        (state (plist-get result :requestState)))
+    (append (mcp--params-to-plist params)
+            (when requests
+              (list :inputResponses (mcp--mrtr-responses connection requests)))
+            ;; The server's opaque state must come back untouched, and must
+            ;; not appear when the server sent none.
+            (when state
+              (list :requestState state)))))
+
+(cl-defun mcp--request-with-input (connection method params)
+  "Send METHOD to CONNECTION with PARAMS, answering server input requests.
+Return the final complete result."
+  (let ((round 0))
+    (while t
+      (let ((result (jsonrpc-request connection method params
+                                     :timeout (mcp--timeout connection))))
+        (unless (mcp--input-required-p result)
+          (cl-return-from mcp--request-with-input result))
+        (setq round (1+ round))
+        (when (> round mcp--mrtr-max-rounds)
+          (signal 'mcp-input-required
+                  (format "%s asked for input %d times" method round)))
+        (setq params (mcp--mrtr-retry-params connection params result))))))
+
+(defun mcp--request-with-input-async (connection method params callback error-callback)
+  "Send METHOD to CONNECTION with PARAMS asynchronously.
+CALLBACK receives the final result.  ERROR-CALLBACK receives a code and
+a message, including when the requested input cannot be provided."
+  (cl-labels ((send (params round)
+                (jsonrpc-async-request
+                 connection method params
+                 :timeout (mcp--timeout connection)
+                 :success-fn
+                 (lambda (result)
+                   (if (not (mcp--input-required-p result))
+                       (funcall callback result)
+                     (condition-case err
+                         (if (>= round mcp--mrtr-max-rounds)
+                             (signal 'mcp-input-required
+                                     (format "%s asked for input %d times"
+                                             method (1+ round)))
+                           (send (mcp--mrtr-retry-params connection params result)
+                                 (1+ round)))
+                       (mcp-input-required
+                        (funcall error-callback mcp--input-required-code
+                                 (error-message-string err))))))
+                 :error-fn
+                 (jsonrpc-lambda (&key code message _data)
+                   (funcall error-callback code message)))))
+    (send params 0)))
 
 ;;;###autoload
 (defun mcp-make-text-tool (name tool-name &optional asyncp)
@@ -598,12 +699,12 @@ ERROR-CALLBACK is a function to call on error."
 CONNECTION is the MCP connection object.
 NAME is the name of the tool to call.
 ARGGUMENTS is a list of arguments to pass to the tool."
-  (jsonrpc-request connection
-                   :tools/call
-                   (list :name name
-                         :arguments (if arguments
-                                        arguments
-                                      #s(hash-table)))))
+  (mcp--request-with-input connection
+                           :tools/call
+                           (list :name name
+                                 :arguments (if arguments
+                                                arguments
+                                              #s(hash-table)))))
 
 (defun mcp-async-call-tool (connection name arguments callback error-callback)
   "Async Call a tool on the remote CONNECTION with NAME and ARGUMENTS.
@@ -613,19 +714,14 @@ NAME is the name of the tool to call.
 ARGUMENTS is a list of arguments to pass to the tool.
 CALLBACK is a function to call on success.
 ERROR-CALLBACK is a function to call on error."
-  (jsonrpc-async-request connection
-                         :tools/call
-                         (list :name name
-                               :arguments (if arguments
-                                              arguments
-                                            #s(hash-table)))
-                         :timeout (mcp--timeout connection)
-                         :success-fn
-                         (lambda (res)
-                           (funcall callback res))
-                         :error-fn
-                         (jsonrpc-lambda (&key code message _data)
-                           (funcall error-callback code message))))
+  (mcp--request-with-input-async connection
+                                 :tools/call
+                                 (list :name name
+                                       :arguments (if arguments
+                                                      arguments
+                                                    #s(hash-table)))
+                                 callback
+                                 error-callback))
 
 (defun mcp-async-list-prompts (connection &optional callback error-callback)
   "Get list of prompts from the MCP server using the provided CONNECTION.
@@ -645,12 +741,12 @@ ERROR-CALLBACK is a function to call on error."
 CONNECTION is the MCP connection object.
 NAME is the name of the prompt to call.
 ARGGUMENTS is a list of arguments to pass to the prompt"
-  (jsonrpc-request connection
-                   :prompts/get
-                   (list :name name
-                         :arguments (if arguments
-                                        arguments
-                                      #s(hash-table)))))
+  (mcp--request-with-input connection
+                           :prompts/get
+                           (list :name name
+                                 :arguments (if arguments
+                                                arguments
+                                              #s(hash-table)))))
 
 (defun mcp-async-get-prompt (connection name arguments callback error-callback)
   "Async Call a prompt on the remote CONNECTION with NAME and ARGUMENTS.
@@ -660,19 +756,14 @@ NAME is the name of the prompt to call.
 ARGUMENTS is a list of arguments to pass to the prompt.
 CALLBACK is a function to call on successful response.
 ERROR-CALLBACK is a function to call on error."
-  (jsonrpc-async-request connection
-                         :prompts/get
-                         (list :name name
-                               :arguments (if arguments
-                                              arguments
-                                            #s(hash-table)))
-                         :timeout (mcp--timeout connection)
-                         :success-fn
-                         (lambda (res)
-                           (funcall callback res))
-                         :error-fn
-                         (jsonrpc-lambda (&key code message _data)
-                           (funcall error-callback code message))))
+  (mcp--request-with-input-async connection
+                                 :prompts/get
+                                 (list :name name
+                                       :arguments (if arguments
+                                                      arguments
+                                                    #s(hash-table)))
+                                 callback
+                                 error-callback))
 
 (defun mcp-async-list-resources (connection &optional callback error-callback)
   "Get list of resources from the MCP server using the provided CONNECTION.
@@ -691,9 +782,9 @@ ERROR-CALLBACK is a function to call on error."
 
 CONNECTION is the MCP connection object.
 URI is the uri of the resource to call."
-  (jsonrpc-request connection
-                   :resources/read
-                   (list :uri uri)))
+  (mcp--request-with-input connection
+                           :resources/read
+                           (list :uri uri)))
 
 (defun mcp-async-read-resource (connection uri &optional callback error-callback)
   "Call a resource on the remote CONNECTION with URI.
@@ -706,16 +797,11 @@ ERROR-CALLBACK is a function to call with the error code and message on failure.
 This function asynchronously reads a resource from the remote connection
 using the specified URI. The result is passed to CALLBACK if the request
 succeeds, or ERROR-CALLBACK if it fails."
-  (jsonrpc-async-request connection
-                         :resources/read
-                         (list :uri uri)
-                         :timeout (mcp--timeout connection)
-                         :success-fn
-                         (lambda (res)
-                           (funcall callback res))
-                         :error-fn
-                         (jsonrpc-lambda (&key code message _data)
-                           (funcall error-callback code message))))
+  (mcp--request-with-input-async connection
+                                 :resources/read
+                                 (list :uri uri)
+                                 callback
+                                 error-callback))
 
 (defun mcp-async-list-resource-templates (connection &optional callback error-callback)
   "Get list of resource templates from the MCP server using the CONNECTION.

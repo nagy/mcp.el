@@ -226,9 +226,11 @@ CALLER-META holds extra keys the caller wants to attach, such as a
 `progressToken'.  Its unknown keys survive.  Reserved keys come from
 this client only."
   (let ((caller (mcp--params-to-plist caller-meta))
-        ;; An empty hash table serializes as {}, which capability-free
-        ;; clients must send rather than null or an empty list.
+        ;; Capabilities are objects, so empty ones serialize as {} rather
+        ;; than null.  The client answers `roots/list' during a multi
+        ;; round-trip request, which is the only capability it declares.
         (capabilities (make-hash-table :test #'equal)))
+    (puthash "roots" (make-hash-table :test #'equal) capabilities)
     (append
      (cl-loop for (key value) on caller by #'cddr
               unless (memq key mcp--meta-reserved-keys)

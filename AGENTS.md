@@ -67,7 +67,6 @@ Byte-compilation warnings are errors. Never relax that.
 - [ ] Full lint gate in the flake: `checkdoc` plus `package-lint` with dependency
       stubs. Currently only byte-compilation guards the tree.
 - [ ] Streamable HTTP over `plz` with an incremental SSE parser.
-- [ ] MRTR support: `input_required` results and `inputResponses` retries.
 - [ ] Pagination plus `ttlMs` / `cacheScope` caching.
 - [ ] `subscriptions/listen` opt-in stream.
 - [ ] Remove stale helpers left over from the deprecated HTTP+SSE transport.
