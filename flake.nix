@@ -34,15 +34,14 @@
         {
           pkgs,
           lib,
-          config,
           ...
         }:
         let
-          inherit (pkgs.emacsPackages) melpaBuild;
           # Elisp dependencies from the Package-Requires header that nixpkgs
           # already packages.
           emacsDeps = with pkgs.emacsPackages; [ jsonrpc plz ];
-          # Emacs with the dependencies on EMACSLOADPATH, for batch test runs.
+          # Emacs with the dependencies on EMACSLOADPATH, for batch test runs
+          # and for the VM test.  The package builds with its own set instead.
           emacs = pkgs.emacsPackages.emacsWithPackages (_: emacsDeps);
           # Byte-compiled leftovers from a local session must never shadow the
           # sources the tests load.
@@ -50,47 +49,73 @@
             src = ./.;
             filter = path: type: !(lib.hasSuffix ".elc" path);
           };
+
+          # The package stays overridable, so a consumer can swap the Emacs,
+          # the dependency set or the source:
+          #   inputs.mcp.packages.${system}.mcp.override {
+          #     emacs = pkgs.emacs-nox;
+          #   }
+          # The flake passes the commit-derived version, because a plain
+          # import of the expression cannot know it.
+          mcp = pkgs.lib.makeOverridable (
+            {
+              # One Emacs package set supplies every dependency, so an
+              # override of this argument moves all of them.
+              emacs ? pkgs.emacs,
+              # `melpaBuild' closes over the Emacs of its package set, so an
+              # `emacs' argument on the build itself does nothing.  Derive
+              # the set from the chosen Emacs instead.
+              emacsPackages ? pkgs.emacsPackagesFor emacs,
+              melpaBuild ? emacsPackages.melpaBuild,
+              # Require this list to move with the package set: a dependency
+              # built for another Emacs fails to load at byte-compile time.
+              packageRequires ? with emacsPackages; [
+                jsonrpc
+                plz
+              ],
+              version ? "0.1.0",
+              # A fork may build from another tree.  The default drops VCS
+              # metadata and stale byte-code.
+              packageSrc ? src,
+            }:
+            melpaBuild {
+              pname = "mcp";
+              inherit version packageRequires;
+              src = packageSrc;
+
+              # Byte-compilation warnings fail the build.
+              # lint gate tracked in AGENTS.md.
+              turnCompilationWarningToError = true;
+
+              meta = {
+                description = "Emacs client and server hub for the Model Context Protocol";
+                longDescription = ''
+                  Connects Emacs to Model Context Protocol servers, locally over
+                  stdio and remotely over Streamable HTTP.  Provides the low-level
+                  jsonrpc-based client in mcp.el, gptel-compatible tool adapters,
+                  and mcp-hub.el, a buffer for starting servers and browsing the
+                  tools, prompts and resources they expose.
+
+                  Targets the stateless 2026-07-28 protocol revision, where every
+                  request carries its protocol version and client capabilities
+                  instead of relying on an initialize handshake.
+                '';
+                # GNU General Public License v3, per the file headers.
+                license = lib.licenses.gpl3Plus;
+                homepage = "https://github.com/lizqwerscott/mcp.el";
+                maintainers = with lib.maintainers; [ ];
+                # mcp.el runs Emacs 30.1 or later on any platform Emacs supports.
+                # The nixpkgs Emacs in the devShell is newer than that floor.
+                platforms = lib.platforms.unix;
+              };
+            }
+          ) { version = "0.1.0-unstable-${commitDate}"; };
         in
         {
-          packages.mcp = melpaBuild {
-            pname = "mcp";
-            # Nix rejects versions it cannot parse.  Convention for unreleased
-            # packages: <upstream-version>-unstable-<YYYY-MM-DD>.  Derived from
-            # the flake's own source info, so it never goes stale.
-            version = "0.1.0-unstable-${commitDate}";
-
-            src = src;
-
-            packageRequires = emacsDeps;
-
-            # Byte-compilation warnings fail the build.
-            # lint gate tracked in AGENTS.md.
-            turnCompilationWarningToError = true;
-
-            meta = {
-              description = "Emacs client and server hub for the Model Context Protocol";
-              longDescription = ''
-                Connects Emacs to Model Context Protocol servers, locally over
-                stdio and remotely over Streamable HTTP.  Provides the low-level
-                jsonrpc-based client in mcp.el, gptel-compatible tool adapters,
-                and mcp-hub.el, a buffer for starting servers and browsing the
-                tools, prompts and resources they expose.
-
-                Targets the stateless 2026-07-28 protocol revision, where every
-                request carries its protocol version and client capabilities
-                instead of relying on an initialize handshake.
-              '';
-              # GNU General Public License v3, per the file headers.
-              license = lib.licenses.gpl3Plus;
-              homepage = "https://github.com/lizqwerscott/mcp.el";
-              maintainers = with lib.maintainers; [ ];
-              # mcp.el runs Emacs 30.1 or later on any platform Emacs supports.
-              # The nixpkgs Emacs in the devShell is newer than that floor.
-              platforms = lib.platforms.unix;
-            };
+          packages = {
+            mcp = mcp;
+            default = mcp;
           };
-
-          packages.default = config.packages.mcp;
 
           # Unit tests: request metadata, HTTP body readers, MRTR helpers.
           # No network access and no subprocesses.

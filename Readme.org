@@ -19,6 +19,14 @@ It speaks the stateless [[https://modelcontextprotocol.io/specification/2026-07-
 * Installation
 Needs Emacs 30.1 or later, the =jsonrpc= and =plz= packages, and =curl= on
 =exec-path= for HTTP servers.
+
+The flake package accepts overrides, so a Nix user can build it against
+another Emacs or another dependency set:
+#+begin_src nix
+  inputs.mcp.packages.${system}.mcp.override {
+    emacs = pkgs.emacs-nox;
+  }
+#+end_src
 #+begin_src elisp
   (use-package mcp
     :ensure t
