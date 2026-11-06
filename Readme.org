@@ -233,9 +233,15 @@ Async requests can be withdrawn with =mcp-cancel-request=.  Over stdio
 this sends =notifications/cancelled=; over HTTP it closes the response
 stream.  A cancelled tool call may still have run on the server, so do not
 retry one that changes state without asking the user first.
+
+The async call returns an =mcp-request= handle.  The handle follows the
+retries of a multi round-trip request, so the cancel always hits the
+attempt that is in flight now.  A plain JSON-RPC id still works too.
 #+begin_src elisp
-  (let ((connection (gethash "filesystem" mcp-server-connections)))
-    (mcp-cancel-request connection request-id "user quit"))
+  (when-let* ((connection (gethash "filesystem" mcp-server-connections))
+              (handle (mcp-async-call-tool connection "search" '(:query "x")
+                                          #'ignore #'ignore)))
+    (mcp-cancel-request connection handle "user quit"))
 #+end_src
 * Protocol notes
 - The client sends =2026-07-28= and reports the versions a server accepts
@@ -256,17 +262,24 @@ retry one that changes state without asking the user first.
 - List results are paged and cached while their declared =ttlMs= stays
   fresh.  Change notifications invalidate the cache and reload the list.
 * Development
-The repository is a Nix flake with an ERT suite.
+The repository is a Nix flake with an ERT suite and a network test.
 #+begin_src sh
-  nix flake check   # package plus unit tests
+  nix flake check   # package, unit tests and the two-VM network test
   nix develop       # Emacs, jsonrpc, plz and curl
   make test         # unit tests without Nix
+  nix build .#checks.x86_64-linux.mcp-vm --print-build-logs
 #+end_src
+
+The network test serves =test/vm/fake_server.py= from one VM and drives it
+from a second VM in batch Emacs, over real sockets and a real stdio
+subprocess.  It checks two servers at once, streamed event responses,
+multi round-trip roots, the required headers, cancellation, and that the
+client log stays free of transport errors.
 * Roadmap
-- [X] HTTP SSE based MCP server connections
 - [X] Stateless 2026-07-28 protocol revision
 - [X] Streamable HTTP with streamed responses
 - [X] Multi round-trip requests, pagination and list caching
+- [X] Streamable HTTP network test in a NixOS VM
 - [ ] mcp marketplace (browser and auto install mcp server)
 - [ ] Simplified integration with other Emacs AI clients
 - [ ] Expanded documentation
