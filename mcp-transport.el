@@ -623,6 +623,37 @@ ARGS holds the JSON-RPC method, parameters and id of the message."
                                 (plist-get params :name)
                                 (plist-get params :arguments))))))
 
+(defconst mcp--cancelled-code -32800
+  "Error code reported locally for a request the client cancelled.")
+
+(defun mcp--http-cancel (connection request-id)
+  "Close the response stream of REQUEST-ID on CONNECTION.
+Return non-nil when a stream was open.  Closing the stream is how the
+transport withdraws a request: the revision has no resumable streams and
+no session to cancel within."
+  (let ((state (gethash request-id mcp--http-streams)))
+    (when (and state
+               (not (eq state :finished))
+               (eq (plist-get state :connection) connection))
+      (when-let* ((proc (plist-get state :process)))
+        (when (process-live-p proc)
+          (delete-process proc))
+        (when (buffer-live-p (process-buffer proc))
+          (kill-buffer (process-buffer proc))))
+      (puthash request-id :finished mcp--http-streams)
+      t)))
+
+(defun mcp--http-cancel-streams (connection)
+  "Close every response stream belonging to CONNECTION."
+  (let (ids)
+    (maphash (lambda (request-id state)
+               (when (and (not (eq state :finished))
+                          (eq (plist-get state :connection) connection))
+                 (push request-id ids)))
+             mcp--http-streams)
+    (dolist (request-id ids)
+      (mcp--http-cancel connection request-id))))
+
 (defun mcp--http-post (connection body headers request-id)
   "POST BODY to CONNECTION with HEADERS.
 REQUEST-ID identifies the request the response carries, or nil for a

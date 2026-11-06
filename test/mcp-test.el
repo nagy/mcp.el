@@ -417,6 +417,37 @@
                           :params (list :name "execute_sql" :arguments (list))))))
       (should-not (assoc "Mcp-Param-Region" headers)))))
 
+;;;; Cancellation
+
+(ert-deftest mcp-test-cancel-http-reports-error ()
+  "Cancelling an HTTP request closes its stream and reports locally."
+  (let ((conn (mcp-test--connection))
+        (captured nil))
+    (puthash 7 (list :connection conn :phase 'body) mcp--http-streams)
+    (cl-letf (((symbol-function 'jsonrpc-connection-receive)
+               (lambda (_connection message) (push message captured))))
+      (mcp-cancel-request conn 7 "user quit"))
+    (should (eq (gethash 7 mcp--http-streams) :finished))
+    (should (equal (plist-get (plist-get (car captured) :error) :code) -32800))
+    (should (equal (plist-get (plist-get (car captured) :error) :message)
+                   "user quit"))))
+
+(ert-deftest mcp-test-cancel-stdio-notifies ()
+  "Cancelling a stdio request sends notifications/cancelled."
+  (let ((conn (mcp-test--connection))
+        (sent nil)
+        (captured nil))
+    (setf (mcp--connection-type conn) 'stdio)
+    (cl-letf (((symbol-function 'mcp-notify)
+               (lambda (_connection method params)
+                 (push (cons method params) sent)))
+              ((symbol-function 'jsonrpc-connection-receive)
+               (lambda (_connection message) (push message captured))))
+      (mcp-cancel-request conn 9))
+    (should (equal (caar sent) :notifications/cancelled))
+    (should (equal (plist-get (cdar sent) :requestId) 9))
+    (should (equal (plist-get (plist-get (car captured) :error) :code) -32800))))
+
 ;;;; Error helpers
 
 (ert-deftest mcp-test-supported-versions-of ()

@@ -441,6 +441,8 @@ from `mcp-server-connections'. If no server with the given NAME is found,
 a message will be displayed indicating that the server is not running."
   (if-let* ((connection (gethash name mcp-server-connections)))
       (progn
+        (when (eq (mcp--connection-type connection) 'http)
+          (mcp--http-cancel-streams connection))
         (ignore-errors
           (jsonrpc-shutdown connection))
         (setf (mcp--status connection) 'stop))
@@ -524,6 +526,38 @@ Returns a plist of argument names and values ready for tool invocation."
                       (append args
                               (when (> need-length 0)
                                 (make-list need-length nil)))))))
+
+;;; Cancellation
+
+(defun mcp--report-cancelled (connection request-id reason)
+  "Resolve REQUEST-ID on CONNECTION with a cancellation error.
+REASON explains the cancellation."
+  (jsonrpc-connection-receive
+   connection
+   (list :jsonrpc "2.0"
+         :id request-id
+         :error (list :code mcp--cancelled-code
+                      :message (or reason "request cancelled")))))
+
+;;;###autoload
+(defun mcp-cancel-request (connection request-id &optional reason)
+  "Cancel the in-flight request REQUEST-ID on CONNECTION.
+REASON is an optional human-readable explanation.
+
+Over stdio this sends notifications/cancelled.  Over Streamable HTTP it
+closes the response stream, because that transport withdraws a request by
+ending the stream.  Either way the caller receives a cancellation error.
+
+A cancelled tool call may still have run on the server: this revision
+gives the client no way to find out, and a broken stream loses the
+request for good.  Do not retry a call that changes state without asking
+the user first."
+  (if (eq (mcp--connection-type connection) 'http)
+      (mcp--http-cancel connection request-id)
+    (mcp-notify connection :notifications/cancelled
+                (list :requestId request-id
+                      :reason (or reason "cancelled by user"))))
+  (mcp--report-cancelled connection request-id reason))
 
 ;;; Multi round-trip requests
 

@@ -68,7 +68,5 @@ Byte-compilation warnings are errors. Never relax that.
 - [ ] Full lint gate in the flake: `checkdoc` plus `package-lint` with dependency
       stubs. Currently only byte-compilation guards the tree.
 - [ ] `subscriptions/listen` opt-in stream for server-push change notifications.
-- [ ] Cancellation: `notifications/cancelled` on stdio, closing the HTTP stream
-      otherwise, and reporting that a retried call may have had side effects.
 - [ ] Report progress notifications (`notifications/progress`) to the user
       instead of only logging them.
