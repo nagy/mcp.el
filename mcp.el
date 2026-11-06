@@ -181,8 +181,8 @@ Returns nil if URL is invalid or not HTTP/HTTPS."
 
 (defun mcp--discover (connection syncp callback error-callback)
   "Ask CONNECTION which protocol versions and capabilities it supports.
-CALLBACK receives the result plist.  ERROR-CALLBACK receives a code
-and a message.
+CALLBACK receives the result plist.  ERROR-CALLBACK receives a code, a
+message and the optional error data.
 
 `server/discover' is an ordinary request, not a handshake.  A modern
 server answers it from scratch, and the answer also gives us the
@@ -198,7 +198,7 @@ server identity that the removed `initialize' response used to carry."
                                      (funcall error-callback code message data))
                                    :timeout-fn
                                    (lambda ()
-                                     (funcall error-callback 124 "timeout"))))))
+                                     (funcall error-callback 124 "timeout" nil))))))
     (if syncp
         (condition-case-unless-debug err
             (progn
@@ -429,7 +429,7 @@ in the `mcp-server-connections` hash table for future reference."
                               (funcall error-callback -1 (format "%s" (cdr err))))
                             (message "Sadly, %s mcp server process start error" name))))))
           (if (not syncp)
-              (run-with-idle-timer 1 nil msg-fn)
+              (run-with-timer 1 nil msg-fn)
             (sit-for 1)
             (funcall msg-fn)))))))
 
@@ -529,6 +529,14 @@ Returns a plist of argument names and values ready for tool invocation."
 
 ;;; Cancellation
 
+(cl-defstruct (mcp-request (:constructor mcp--make-request (connection id))
+                           (:copier nil))
+  "Handle for an asynchronous request, for `mcp-cancel-request'.
+CONNECTION names the connection.  ID holds the JSON-RPC id of the
+current attempt, which a multi round-trip retry replaces."
+  connection
+  id)
+
 (defun mcp--report-cancelled (connection request-id reason)
   "Resolve REQUEST-ID on CONNECTION with a cancellation error.
 REASON explains the cancellation."
@@ -542,7 +550,10 @@ REASON explains the cancellation."
 ;;;###autoload
 (defun mcp-cancel-request (connection request-id &optional reason)
   "Cancel the in-flight request REQUEST-ID on CONNECTION.
-REASON is an optional human-readable explanation.
+REQUEST-ID is a JSON-RPC id or an `mcp-request' handle, such as the one
+`mcp-async-call-tool' returns.  A handle follows multi round-trip
+retries, so it cancels the attempt that is in flight now.  REASON is an
+optional human-readable explanation.
 
 Over stdio this sends notifications/cancelled.  Over Streamable HTTP it
 closes the response stream, because that transport withdraws a request by
@@ -552,12 +563,17 @@ A cancelled tool call may still have run on the server: this revision
 gives the client no way to find out, and a broken stream loses the
 request for good.  Do not retry a call that changes state without asking
 the user first."
-  (if (eq (mcp--connection-type connection) 'http)
-      (mcp--http-cancel connection request-id)
-    (mcp-notify connection :notifications/cancelled
-                (list :requestId request-id
-                      :reason (or reason "cancelled by user"))))
-  (mcp--report-cancelled connection request-id reason))
+  (let* ((handle (and (mcp-request-p request-id) request-id))
+         (connection (or (and handle (mcp-request-connection handle))
+                         connection))
+         (request-id (if handle (mcp-request-id handle) request-id)))
+    (when (and connection request-id)
+      (if (eq (mcp--connection-type connection) 'http)
+          (mcp--http-cancel connection request-id)
+        (mcp-notify connection :notifications/cancelled
+                    (list :requestId request-id
+                          :reason (or reason "cancelled by user"))))
+      (mcp--report-cancelled connection request-id reason))))
 
 ;;; Multi round-trip requests
 
@@ -604,23 +620,29 @@ capabilities it never declared."
 
 (defun mcp--mrtr-retry-params (roots params result)
   "Return PARAMS extended with the answers RESULT asks for.
-ROOTS holds the client roots to offer."
+ROOTS holds the client roots to offer.  The keys this adds replace any
+earlier copy, so a retry never carries two values for one key."
   (let ((requests (plist-get result :inputRequests))
-        (state (plist-get result :requestState)))
-    (append (mcp--params-to-plist params)
-            (when requests
-              (list :inputResponses (mcp--mrtr-responses roots requests)))
-            ;; The server's opaque state must come back untouched, and must
-            ;; not appear when the server sent none.
-            (when state
-              (list :requestState state)))))
+        (state (plist-get result :requestState))
+        (params (mcp--params-to-plist params)))
+    (when requests
+      (setq params (plist-put params :inputResponses
+                              (mcp--mrtr-responses roots requests))))
+    ;; The server's opaque state must come back untouched, and must not
+    ;; appear when the server sent none.
+    (when state
+      (setq params (plist-put params :requestState state)))
+    params))
 
 (cl-defun mcp--request-with-input (connection method params)
   "Send METHOD to CONNECTION with PARAMS, answering server input requests.
-Return the final complete result."
-  (let ((round 0))
+Return the final complete result.  Each round starts from PARAMS, so a
+retry holds exactly one set of answers."
+  (let ((round 0)
+        (base (mcp--params-to-plist params))
+        (current (mcp--params-to-plist params)))
     (while t
-      (let ((result (jsonrpc-request connection method params
+      (let ((result (jsonrpc-request connection method current
                                      :timeout (mcp--timeout connection))))
         (unless (mcp--input-required-p result)
           (cl-return-from mcp--request-with-input result))
@@ -628,36 +650,46 @@ Return the final complete result."
         (when (> round mcp--mrtr-max-rounds)
           (signal 'mcp-input-required
                   (list (format "%s asked for input %d times" method round))))
-        (setq params (mcp--mrtr-retry-params (mcp--roots connection)
-                                             params result))))))
+        (setq current (mcp--mrtr-retry-params (mcp--roots connection)
+                                             base result))))))
 
 (defun mcp--request-with-input-async (connection method params callback error-callback)
   "Send METHOD to CONNECTION with PARAMS asynchronously.
 CALLBACK receives the final result.  ERROR-CALLBACK receives a code and
-a message, including when the requested input cannot be provided."
-  (cl-labels ((send (params round)
-                (jsonrpc-async-request
-                 connection method params
-                 :timeout (mcp--timeout connection)
-                 :success-fn
-                 (lambda (result)
-                   (if (not (mcp--input-required-p result))
-                       (funcall callback result)
-                     (condition-case err
-                         (if (>= round mcp--mrtr-max-rounds)
-                             (signal 'mcp-input-required
-                                     (list (format "%s asked for input %d times"
-                                                   method (1+ round))))
-                           (send (mcp--mrtr-retry-params
-                                  (mcp--roots connection) params result)
-                                 (1+ round)))
-                       (mcp-input-required
-                        (funcall error-callback mcp--input-required-code
-                                 (error-message-string err))))))
-                 :error-fn
-                 (jsonrpc-lambda (&key code message _data)
-                   (funcall error-callback code message)))))
-    (send params 0)))
+a message, including when the requested input cannot be provided.
+Return an `mcp-request' handle that follows the retries, for
+`mcp-cancel-request'."
+  (let ((handle (mcp--make-request connection nil))
+        (base (mcp--params-to-plist params)))
+    (cl-labels ((send (params round)
+                  (setf (mcp-request-id handle)
+                        (car-safe
+                         (jsonrpc-async-request
+                          connection method params
+                          :timeout (mcp--timeout connection)
+                          :success-fn
+                          (lambda (result)
+                            (if (not (mcp--input-required-p result))
+                                (funcall callback result)
+                              (condition-case err
+                                  (if (>= round mcp--mrtr-max-rounds)
+                                      (signal 'mcp-input-required
+                                              (list (format "%s asked for input %d times"
+                                                            method (1+ round))))
+                                    (send (mcp--mrtr-retry-params
+                                           (mcp--roots connection) base result)
+                                          (1+ round)))
+                                (mcp-input-required
+                                 (funcall error-callback mcp--input-required-code
+                                          (error-message-string err))))))
+                          :timeout-fn
+                          (lambda ()
+                            (funcall error-callback 124 "timeout"))
+                          :error-fn
+                          (jsonrpc-lambda (&key code message _data)
+                            (funcall error-callback code message)))))))
+      (send base 0)
+      handle)))
 
 ;;;###autoload
 (defun mcp-make-text-tool (name tool-name &optional asyncp)
@@ -781,7 +813,7 @@ ERROR-CALLBACK receives a code and a message."
                           (next (plist-get result :nextCursor)))
                      (cond
                       ((and next (not (string-empty-p next)))
-                       (if (> pages mcp--list-max-pages)
+                       (if (>= pages mcp--list-max-pages)
                            (progn
                              (message "[mcp] %s returned more than %d pages, stopping"
                                       method mcp--list-max-pages)
@@ -790,7 +822,10 @@ ERROR-CALLBACK receives a code and a message."
                       (t (funcall done items ttl-ms)))))
                  :error-fn
                  (jsonrpc-lambda (&key code message _data)
-                   (funcall error-callback code message)))))
+                   (funcall error-callback code message))
+                 :timeout-fn
+                 (lambda ()
+                   (funcall error-callback 124 "timeout")))))
     (page nil [] nil 1)))
 
 (defun mcp--list-items (connection method key-name slot-name callback error-callback syncp)
@@ -835,7 +870,10 @@ Return the cached or fetched items, or nil when the request failed."
                (funcall error-fn
                         (list :code (alist-get 'jsonrpc-error-code (cdr err))
                               :message (alist-get 'jsonrpc-error-message (cdr err))))
-               nil))
+               nil)
+               ;; The callback already saw the failure, so hand the
+               ;; caller the documented empty answer.
+               nil)
           (mcp--list-pages-async connection method key-name store error-fn)
           cached-items)))))
 
@@ -871,7 +909,9 @@ CONNECTION is the MCP connection object.
 NAME is the name of the tool to call.
 ARGUMENTS is a list of arguments to pass to the tool.
 CALLBACK is a function to call on success.
-ERROR-CALLBACK is a function to call on error."
+ERROR-CALLBACK is a function to call on error.
+
+Return an `mcp-request' handle for `mcp-cancel-request'."
   (mcp--request-with-input-async connection
                                  :tools/call
                                  (list :name name
@@ -913,7 +953,9 @@ CONNECTION is the MCP connection object.
 NAME is the name of the prompt to call.
 ARGUMENTS is a list of arguments to pass to the prompt.
 CALLBACK is a function to call on successful response.
-ERROR-CALLBACK is a function to call on error."
+ERROR-CALLBACK is a function to call on error.
+
+Return an `mcp-request' handle for `mcp-cancel-request'."
   (mcp--request-with-input-async connection
                                  :prompts/get
                                  (list :name name
@@ -954,7 +996,9 @@ ERROR-CALLBACK is a function to call with the error code and message on failure.
 
 This function asynchronously reads a resource from the remote connection
 using the specified URI. The result is passed to CALLBACK if the request
-succeeds, or ERROR-CALLBACK if it fails."
+succeeds, or ERROR-CALLBACK if it fails.
+
+Return an `mcp-request' handle for `mcp-cancel-request'."
   (mcp--request-with-input-async connection
                                  :resources/read
                                  (list :uri uri)

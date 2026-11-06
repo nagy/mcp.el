@@ -432,6 +432,22 @@
     (should (equal (plist-get (plist-get (car captured) :error) :message)
                    "user quit"))))
 
+(ert-deftest mcp-test-cancel-request-handle-follows-id ()
+  "A handle cancels the attempt that is in flight now."
+  (let* ((conn (mcp-test--connection))
+         (handle (mcp--make-request conn 3))
+         (captured nil))
+    (mcp--http-stream-put conn 3 (list :connection conn :phase 'body))
+    (cl-letf (((symbol-function 'jsonrpc-connection-receive)
+               (lambda (_connection message) (push message captured))))
+      (setf (mcp-request-id handle) 4)
+      (mcp--http-stream-put conn 4 (list :connection conn :phase 'body))
+      (mcp-cancel-request nil handle "user quit"))
+    (should (eq (mcp--http-stream-get conn 4) :finished))
+    (should (equal (mcp--http-stream-get conn 3)
+                   (list :connection conn :phase 'body)))
+    (should (equal (plist-get (car captured) :id) 4))))
+
 (ert-deftest mcp-test-cancel-stdio-notifies ()
   "Cancelling a stdio request sends notifications/cancelled."
   (let ((conn (mcp-test--connection))
@@ -558,6 +574,65 @@
                  '("{\"ok\":true}")))
   (should-not (mcp--response-payloads "text/html" "<html></html>"))
   (should-not (mcp--response-payloads nil "")))
+
+;;;; Multi round-trip retries
+
+(ert-deftest mcp-test-mrtr-retry-params-single-keys ()
+  "A retry built twice still carries one value per key."
+  (let* ((result (list :inputRequests (list :r1 (list :method "roots/list"))
+                       :requestState "state-1"))
+         (first (mcp--mrtr-retry-params '("/tmp") '(:name "t") result))
+         (second (mcp--mrtr-retry-params '("/tmp") first result)))
+    (dolist (params (list first second))
+      (should (= 1 (mcp-test--count-key :inputResponses params)))
+      (should (= 1 (mcp-test--count-key :requestState params)))
+      (should (= 1 (mcp-test--count-key :name params))))
+    (should (equal (plist-get second :requestState) "state-1"))))
+
+(ert-deftest mcp-test-request-with-input-retries-cleanly ()
+  "Every round sends the answers once, built from the caller params."
+  (let ((conn (mcp-test--connection))
+        (sent nil)
+        (round 0))
+    (setf (mcp--roots conn) '("/tmp/root"))
+    (cl-letf (((symbol-function 'jsonrpc-request)
+               (lambda (_connection _method params &rest _args)
+                 (push params sent)
+                 (setq round (1+ round))
+                 (if (< round 3)
+                     (list :resultType "input_required"
+                           :inputRequests (list :r1 (list :method "roots/list"))
+                           :requestState (format "state-%d" round))
+                   (list :resultType "complete")))))
+      (let ((result (mcp--request-with-input conn :tools/call '(:name "roots"))))
+        (should (equal (plist-get result :resultType) "complete"))))
+    (dolist (params sent)
+      (should (= 1 (mcp-test--count-key :inputResponses params)))
+      (should (= 1 (mcp-test--count-key :requestState params))))
+    (should (equal (plist-get (plist-get (car sent) :inputResponses) :r1)
+                   (mcp--roots-result '("/tmp/root"))))
+    (should (equal (plist-get (car sent) :requestState) "state-2"))))
+
+;;;; Discover timeouts
+
+(ert-deftest mcp-test-discover-timeout-reports-error ()
+  "A timeout reaches the error callback with all three arguments."
+  (let ((conn (mcp-test--connection))
+        (timeout-fn nil)
+        (reported nil))
+    (cl-letf (((symbol-function 'jsonrpc-async-request)
+               (lambda (&rest args)
+                 ;; ARGS starts with the connection, so pair up from the tail.
+                 (setq timeout-fn
+                       (cl-loop for (key value) on (cdr args) by #'cddr
+                                when (eq key :timeout-fn) return value))
+                 '(1 nil))))
+      (mcp--discover conn nil #'ignore
+                     (lambda (code message data)
+                       (setq reported (list code message data))))
+      (should (functionp timeout-fn))
+      (funcall timeout-fn))
+    (should (equal reported '(124 "timeout" nil)))))
 
 ;;;; Error helpers
 
