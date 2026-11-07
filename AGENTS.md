@@ -44,6 +44,7 @@ nix flake check           # package, ERT unit tests and the network VM test
 nix develop               # Emacs 31.1 plus jsonrpc, curl, plz in PATH
 make test                 # ERT unit tests, no network and no subprocesses
 make compile              # byte-compile with warnings as errors
+nix fmt                   # format the nix files
 git diff --no-ext-diff    # always diff without external tools
 ```
 
@@ -64,6 +65,19 @@ emacs -Q --batch --eval "(setq byte-compile-error-on-warn t)" -f batch-byte-comp
 ```
 
 Byte-compilation warnings are errors. Never relax that.
+
+## Formatting
+
+`treefmt-nix` drives `nixfmt` from `flake.nix`. Elisp and Python stay
+unformatted by the tool.
+
+| Formatter | Files |
+|---|---|
+| `nixfmt` | `flake.nix`, `*.nix` |
+
+Run `nix fmt` before a commit. `nix flake check` runs the same treefmt in
+check mode as `checks.treefmt`, so an unformatted file fails the gate. Do not
+run a formatter alone: the options live in the flake only.
 
 ## Conventions
 

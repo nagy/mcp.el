@@ -4,10 +4,20 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
+    # Formatter driver behind `nix fmt`.  Its nixpkgs must follow ours, or
+    # the formatters run against an interpreter we do not build with.
+    treefmt-nix = {
+      url = "github:numtide/treefmt-nix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
-    inputs@{ flake-parts, ... }:
+    inputs@{
+      flake-parts,
+      treefmt-nix,
+      ...
+    }:
     # Date of the last commit as YYYY-MM-DD, folded into the version string
     # below.  Flake source info gives it as e.g. "20260922133522", so slice out
     # the year, month and day and glue them with hyphens.  A tree without
@@ -18,11 +28,12 @@
           date = inputs.self.sourceInfo.lastModifiedDate;
         in
         if date == null then "19700101000000" else date;
-      commitDate = "${builtins.substring 0 4 stamp}-${
-        builtins.substring 4 2 stamp
-      }-${builtins.substring 6 2 stamp}";
+      commitDate = "${builtins.substring 0 4 stamp}-${builtins.substring 4 2 stamp}-${builtins.substring 6 2 stamp}";
     in
     flake-parts.lib.mkFlake { inherit inputs; } {
+      # Adds `checks.treefmt` and the `nix fmt` app.
+      imports = [ treefmt-nix.flakeModule ];
+
       # Elisp is architecture independent, so there is no cost in evaluating
       # both Linux arches.
       systems = [
@@ -34,12 +45,16 @@
         {
           pkgs,
           lib,
+          config,
           ...
         }:
         let
           # Elisp dependencies from the Package-Requires header that nixpkgs
           # already packages.
-          emacsDeps = with pkgs.emacsPackages; [ jsonrpc plz ];
+          emacsDeps = with pkgs.emacsPackages; [
+            jsonrpc
+            plz
+          ];
           # Emacs with the dependencies on EMACSLOADPATH, for batch test runs
           # and for the VM test.  The package builds with its own set instead.
           emacs = pkgs.emacsPackages.emacsWithPackages (_: emacsDeps);
@@ -47,7 +62,7 @@
           # sources the tests load.
           src = lib.cleanSourceWith {
             src = ./.;
-            filter = path: type: !(lib.hasSuffix ".elc" path);
+            filter = path: _type: !(lib.hasSuffix ".elc" path);
           };
 
           # The package stays overridable, so a consumer can swap the Emacs,
@@ -113,22 +128,25 @@
         in
         {
           packages = {
-            mcp = mcp;
+            inherit mcp;
             default = mcp;
           };
 
           # Unit tests: request metadata, HTTP body readers, MRTR helpers.
           # No network access and no subprocesses.
-          checks.ert = pkgs.runCommand "mcp-ert" {
-            nativeBuildInputs = [ emacs ];
-            inherit src;
-          } ''
-            export HOME=$TMPDIR
-            emacs --batch --eval "(require 'package)" -f package-initialize \
-              -L "$src" -L "$src/test" -l ert -l mcp-test.el \
-              -f ert-run-tests-batch-and-exit
-            touch $out
-          '';
+          checks.ert =
+            pkgs.runCommand "mcp-ert"
+              {
+                nativeBuildInputs = [ emacs ];
+                inherit src;
+              }
+              ''
+                export HOME=$TMPDIR
+                emacs --batch --eval "(require 'package)" -f package-initialize \
+                  -L "$src" -L "$src/test" -l ert -l mcp-test.el \
+                  -f ert-run-tests-batch-and-exit
+                touch $out
+              '';
 
           # Network test: two VMs, real sockets, real subprocesses.  The ERT
           # suite can only stub the transport, so this is the check that sees
@@ -191,10 +209,20 @@
             '';
           };
 
+          # One formatter set for the tree.  `nix flake check` runs the same
+          # treefmt in check mode, so a commit cannot leave it unformatted.
+          treefmt.programs.nixfmt.enable = true;
+
           devShells.default = pkgs.mkShell {
             # Emacs is 31.1 here while the package header keeps a 30.1 floor:
             # nixpkgs-unstable no longer carries emacs30.
-            packages = [ emacs pkgs.curl ];
+            packages = [
+              emacs
+              pkgs.curl
+              # `treefmt` in the shell, so formatting works without Nix
+              # evaluation on every run.
+              config.treefmt.build.wrapper
+            ];
           };
         };
     };
