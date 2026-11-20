@@ -380,41 +380,41 @@ in the `mcp-server-connections` hash table for future reference."
                                :coding 'utf-8-unix
                                ;; :noquery t
                                :stderr (get-buffer-create
-                                        (format "*%s stderr*" name))
-                               ;; :file-handler t
-                               ))))))
-         (let ((connection (apply #'make-instance
-                                `(,(pcase connection-type
-                                     ('http
-                                      'mcp-http-process-connection)
-                                     ('stdio
-                                      'mcp-stdio-process-connection))
-                                  :connection-type ,connection-type
-                                  :name ,name
-                                  :process ,process
-                                  :roots ,roots
-                                  :timeout ,(or timeout jsonrpc-default-request-timeout)
-                                  :events-buffer-config (:size ,mcp-log-size)
-                                  :request-dispatcher ,(lambda (_ method params)
-                                                         (funcall #'mcp--reject-server-request
-                                                                  name method params))
-                                  :notification-dispatcher ,(lambda (connection method params)
-                                                              (funcall #'mcp-notification-dispatcher connection name method params))
-                                  :on-shutdown ,(lambda (_)
-                                                  (funcall #'mcp-on-shutdown name))
-                                  :initial-callback ,initial-callback
-                                  :prompts-callback ,prompts-callback
-                                  :tools-callback ,tools-callback
-                                  :resources-callback ,resources-callback
-                                  :resources-templates-callback ,resources-templates-callback
-                                  :error-callback ,error-callback
-                                  ,@(when (equal connection-type 'http)
-                                      (list :host (plist-get server-config :host)
-                                            :port (plist-get server-config :port)
-                                            :tls (plist-get server-config :tls)
-                                            :path (plist-get server-config :path)
-                                            :token (plist-get server-config :token)
-                                            :headers (plist-get server-config :headers)))))))
+                                        (format "*%s stderr*" name))))))))
+      ;; :file-handler t
+
+      (let ((connection (apply #'make-instance
+                               `(,(pcase connection-type
+                                    ('http
+                                     'mcp-http-process-connection)
+                                    ('stdio
+                                     'mcp-stdio-process-connection))
+                                 :connection-type ,connection-type
+                                 :name ,name
+                                 :process ,process
+                                 :roots ,roots
+                                 :timeout ,(or timeout jsonrpc-default-request-timeout)
+                                 :events-buffer-config (:size ,mcp-log-size)
+                                 :request-dispatcher ,(lambda (_ method params)
+                                                        (funcall #'mcp--reject-server-request
+                                                                 name method params))
+                                 :notification-dispatcher ,(lambda (connection method params)
+                                                             (funcall #'mcp-notification-dispatcher connection name method params))
+                                 :on-shutdown ,(lambda (_)
+                                                 (funcall #'mcp-on-shutdown name))
+                                 :initial-callback ,initial-callback
+                                 :prompts-callback ,prompts-callback
+                                 :tools-callback ,tools-callback
+                                 :resources-callback ,resources-callback
+                                 :resources-templates-callback ,resources-templates-callback
+                                 :error-callback ,error-callback
+                                 ,@(when (equal connection-type 'http)
+                                     (list :host (plist-get server-config :host)
+                                           :port (plist-get server-config :port)
+                                           :tls (plist-get server-config :tls)
+                                           :path (plist-get server-config :path)
+                                           :token (plist-get server-config :token)
+                                           :headers (plist-get server-config :headers)))))))
         (puthash name connection mcp-server-connections)
         ;; Discover what the server supports, then load its lists.
         (let* ((msg-fn (lambda ()
@@ -593,7 +593,7 @@ the user first."
   "Error code reported when the client cannot provide requested input.")
 
 (define-error 'mcp-input-required
-  "MCP server requires client input that this client cannot provide")
+              "MCP server requires client input that this client cannot provide")
 
 (defun mcp--input-required-p (result)
   "Return non-nil when RESULT asks for more client input.
@@ -651,7 +651,7 @@ retry holds exactly one set of answers."
           (signal 'mcp-input-required
                   (list (format "%s asked for input %d times" method round))))
         (setq current (mcp--mrtr-retry-params (mcp--roots connection)
-                                             base result))))))
+                                              base result))))))
 
 (defun mcp--request-with-input-async (connection method params callback error-callback)
   "Send METHOD to CONNECTION with PARAMS asynchronously.
@@ -871,9 +871,9 @@ Return the cached or fetched items, or nil when the request failed."
                         (list :code (alist-get 'jsonrpc-error-code (cdr err))
                               :message (alist-get 'jsonrpc-error-message (cdr err))))
                nil)
-               ;; The callback already saw the failure, so hand the
-               ;; caller the documented empty answer.
-               nil)
+              ;; The callback already saw the failure, so hand the
+              ;; caller the documented empty answer.
+              nil)
           (mcp--list-pages-async connection method key-name store error-fn)
           cached-items)))))
 
