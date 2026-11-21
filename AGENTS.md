@@ -19,8 +19,7 @@ newer in `Package-Requires`, with `jsonrpc` and `plz`. License: AGPL-3.0-or-late
 
 ## Build and test
 
-- `nix flake check` — package, ERT unit tests, the network VM test, treefmt in
-  check mode. Gate for a commit.
+- `nix flake check` — the gate. Run before a commit.
 - `nix build` — the package.
 - `make test` — ERT unit tests, no network and no subprocess.
 - `make compile` — byte-compile only.
