@@ -21,9 +21,9 @@ newer in `Package-Requires`, with `jsonrpc` and `plz`. License: AGPL-3.0-or-late
 
 - `nix flake check` — package, ERT unit tests, the network VM test, treefmt in
   check mode. Gate for a commit.
-- `nix build` — `melpaBuild`, byte-compile with warnings as errors.
+- `nix build` — the package.
 - `make test` — ERT unit tests, no network and no subprocess.
-- `make compile` — byte-compile with warnings as errors.
+- `make compile` — byte-compile only.
 - `nix fmt` — nixfmt through treefmt. Run it before a commit.
 - `nix develop` — Emacs 31.1 plus jsonrpc, curl and plz on `PATH`.
 - `nix build .#checks.x86_64-linux.mcp-vm --print-build-logs` — the network test
@@ -73,7 +73,7 @@ table is evaluated once and shared by every instance.
 
 ## Rules
 
-- Never relax `byte-compile-error-on-warn`. Byte-compilation warnings are errors.
+- Never relax `byte-compile-error-on-warn`. A relaxed gate ships the defect.
 - Change a transport, a header or a retry, and run the network VM test. The ERT
   suite stubs the transport and cannot see a wire-level regression.
 - Insert the response text into the process buffer from a `:filter`. `plz` parses
